@@ -48,31 +48,46 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 		return nil, err
 	}
 	nodes, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
-
 	if err != nil {
 		return nil, err
 	}
-	errs := make([]error, len(nodes))
+
 	readers := make([]io.Reader, len(nodes))
+	// Use a WaitGroup to wait for all goroutines to finish.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errs := make([]error, len(nodes))
+
 	for i, node := range nodes {
-		go func(ctx context.Context, index int) {
+		wg.Add(1)
+		go func(index int, node shard) {
+			defer wg.Done()
 			cli := c.getS3Client(node.NodeAddress)
 			resp, err := cli.GetObject(ctx, params)
 			if err != nil {
-				errs[i] = err
+				mu.Lock()
+				errs[index] = err
+				mu.Unlock()
 				return
 			}
-			readers[i] = resp.Body
-		}(ctx, i)
+			mu.Lock()
+			readers[index] = resp.Body
+			mu.Unlock()
+		}(i, node)
 	}
+
+	wg.Wait()
+
 	errCount := 0
 	for _, e := range errs {
 		if e != nil {
 			errCount++
 		}
 	}
-	if errCount > conf.DataShard {
-		return nil, errors.New("download file error")
+
+	// If too many shards failed, return error.
+	if len(nodes)-errCount < conf.DataShard {
+		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, len(nodes)-errCount)
 	}
 
 	erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
@@ -81,10 +96,24 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 	}
 
 	r, w := io.Pipe()
-	err = erasure.Decode(ctx, w, readers)
-	if err != nil {
-		return nil, err
-	}
+
+	go func() {
+		// Close all readers and the writer when the goroutine finishes.
+		defer func() {
+			for _, r := range readers {
+				if r != nil {
+					r.(io.Closer).Close()
+				}
+			}
+			w.Close()
+		}()
+
+		err := erasure.Decode(ctx, w, readers)
+		if err != nil {
+			// Propagate the error to the reader side.
+			w.CloseWithError(err)
+		}
+	}()
 
 	return &s3.GetObjectOutput{
 		Body: r,
@@ -92,7 +121,6 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 }
 
 func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.Client {
-	//fixme use pool
 	cli := s3.NewFromConfig(aws.Config{
 		Region:       c.region,
 		BaseEndpoint: &endpoint,
