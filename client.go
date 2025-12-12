@@ -34,12 +34,20 @@ type Client struct {
 type Config struct {
 }
 
-func NewClient() *Client {
-	scheduler := newScheduler("http://192.168.0.30:8888")
+func NewClient(schedulerURL string) *Client {
+	scheduler := newScheduler(schedulerURL)
 	return &Client{
 		region:    "us-east-1",
 		scheduler: scheduler,
 	}
+}
+
+func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.Client {
+	cli := s3.NewFromConfig(aws.Config{
+		Region:       c.region,
+		BaseEndpoint: &endpoint,
+	}, optFns...)
+	return cli
 }
 
 func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -54,29 +62,37 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 
 	readers := make([]io.Reader, len(nodes))
 	// Use a WaitGroup to wait for all goroutines to finish.
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	errs := make([]error, len(nodes))
-
+	type result struct {
+		idx    int
+		reader io.ReadCloser
+		err    error
+	}
+	resultCh := make(chan result, len(nodes))
 	for i, node := range nodes {
-		wg.Add(1)
 		go func(index int, node shard) {
-			defer wg.Done()
 			cli := c.getS3Client(node.NodeAddress)
 			resp, err := cli.GetObject(ctx, params)
 			if err != nil {
-				mu.Lock()
-				errs[index] = err
-				mu.Unlock()
+				resultCh <- result{idx: index, err: err}
 				return
 			}
-			mu.Lock()
-			readers[index] = resp.Body
-			mu.Unlock()
+			resultCh <- result{idx: index, reader: resp.Body}
 		}(i, node)
 	}
 
-	wg.Wait()
+	errs := make([]error, len(nodes))
+	for range nodes {
+		res := <-resultCh
+		if res.err != nil {
+			errs[res.idx] = res.err
+			// Also close any readers that might have been opened before the error
+			if res.reader != nil {
+				res.reader.Close()
+			}
+			continue
+		}
+		readers[res.idx] = res.reader
+	}
 
 	errCount := 0
 	for _, e := range errs {
@@ -120,14 +136,6 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 	}, nil
 }
 
-func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.Client {
-	cli := s3.NewFromConfig(aws.Config{
-		Region:       c.region,
-		BaseEndpoint: &endpoint,
-	}, optFns...)
-	return cli
-}
-
 func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	body := params.Body
 
@@ -167,7 +175,7 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 		r, w := io.Pipe()
 		writers[i] = w
 		go func(ctx context.Context, index int, n node, r io.ReadCloser) {
-			endpoint := fmt.Sprintf("http://%s:%d", "192.168.0.30", n.Port)
+			endpoint := fmt.Sprintf("http://%s:%d", n.Host, n.Port)
 			defer func() {
 				wg.Done()
 				r.Close()
@@ -182,9 +190,9 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 			}()
 			newParams := clonePutObjectInputWithNewBody(params, r)
 			out, err := manager.NewUploader(c.getS3Client(endpoint, optFns...)).Upload(ctx, &newParams)
-			log.Println(out, err)
+			log.Println(out, fmt.Errorf("shard %d upload err:%w", i+1, err))
 			if err != nil {
-				errs[index] = err
+				errs[index] = fmt.Errorf("shard %d upload err:%w", i+1, err)
 				return
 			}
 		}(ctx, i, n, r)
@@ -196,7 +204,9 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 	}
 
 	for _, w := range writers {
-		_ = w.(io.Closer).Close()
+		if err := w.(io.Closer).Close(); err != nil {
+			log.Printf("failed to close writer: %v", err)
+		}
 	}
 	wg.Wait()
 	if err := c.scheduler.commitObject(ctx, commitObjectReq{

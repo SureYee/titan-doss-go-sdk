@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"time"
 )
 
 type response[T any] struct {
@@ -63,6 +64,9 @@ type scheduler struct {
 func newScheduler(baseUrl string) *scheduler {
 	return &scheduler{
 		baseUrl: baseUrl,
+		cli: http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 }
 
