@@ -14,7 +14,7 @@ import (
 )
 
 func TestUpload(t *testing.T) {
-	cli := NewClient("http://192.168.0.30:8888")
+	cli := NewClient(Config{SchedulerURL: "http://192.168.0.30:8888"})
 	file, err := os.Open("tmp/file.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -46,25 +46,25 @@ func TestS3Upload(t *testing.T) {
 	}
 
 	m := manager.NewUploader(s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://192.168.0.30:9091")
+		o.BaseEndpoint = aws.String("http://127.0.0.1:9000")
 	}))
 	f, err := os.Open("tmp/file")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp, err := m.Upload(t.Context(), &s3.PutObjectInput{
-		Bucket: aws.String("default"),
+		Bucket: aws.String("mybucket"),
 		Key:    aws.String("file"),
 		Body:   f,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log(resp)
+	t.Logf("%#v", resp)
 }
 
 func TestDownload(t *testing.T) {
-	cli := NewClient("http://192.168.0.30:8888")
+	cli := NewClient(Config{SchedulerURL: "http://192.168.0.30:8888"})
 	bucket := "default"
 	key := "file"
 	resp, err := cli.GetObject(t.Context(), &s3.GetObjectInput{

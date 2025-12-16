@@ -3,6 +3,8 @@ package doss
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,11 +12,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/middleware"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/titan/doss-go-sdk/internal"
 )
 
@@ -29,16 +34,31 @@ const (
 type Client struct {
 	region    string
 	scheduler *scheduler
+	cfg       Config
 }
 
 type Config struct {
+	SchedulerURL        string
+	Region              string
+	MaxRetryElapsedTime time.Duration
 }
 
-func NewClient(schedulerURL string) *Client {
-	scheduler := newScheduler(schedulerURL)
+func NewClient(cfg Config) *Client {
+	if cfg.SchedulerURL == "" {
+		// Or return an error, for now, let's panic
+		panic("SchedulerURL must be set")
+	}
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+	if cfg.MaxRetryElapsedTime == 0 {
+		cfg.MaxRetryElapsedTime = time.Second
+	}
+	scheduler := newScheduler(cfg.SchedulerURL)
 	return &Client{
-		region:    "us-east-1",
+		region:    cfg.Region,
 		scheduler: scheduler,
+		cfg:       cfg,
 	}
 }
 
@@ -50,60 +70,86 @@ func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.C
 	return cli
 }
 
+func (c *Client) downloadWithoutEncode() {
+
+}
+
+func (c *Client) downloadWithEncode() {
+
+}
+
 func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	conf, err := c.scheduler.getErasureConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	nodes, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
+	resp, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
 	if err != nil {
 		return nil, err
 	}
 
-	readers := make([]io.Reader, len(nodes))
-	// Use a WaitGroup to wait for all goroutines to finish.
-	type result struct {
-		idx    int
-		reader io.ReadCloser
-		err    error
-	}
-	resultCh := make(chan result, len(nodes))
-	for i, node := range nodes {
-		go func(index int, node shard) {
+	nodes := resp.Shards
+	conf := resp.Config
+
+	if !conf.Encode {
+		var err error
+		var resp *s3.GetObjectOutput
+		for _, node := range nodes {
 			cli := c.getS3Client(node.NodeAddress)
-			resp, err := cli.GetObject(ctx, params)
+			resp, err = cli.GetObject(ctx, params)
 			if err != nil {
-				resultCh <- result{idx: index, err: err}
-				return
+				continue
 			}
-			resultCh <- result{idx: index, reader: resp.Body}
-		}(i, node)
+		}
+		return resp, err
+	}
+	readers := make([]io.Reader, len(nodes))
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	// We still need to count successful downloads to see if we have enough shards.
+	var successfulDownloads int
+	var mu sync.Mutex
+
+	for i, node := range nodes {
+		index := i
+		node := node
+		eg.Go(func() error {
+			cli := c.getS3Client(node.NodeAddress)
+			resp, err := cli.GetObject(egCtx, params)
+			if err != nil {
+				// Don't return error here, just log it or mark this reader as nil.
+				// errgroup would cancel all other downloads.
+				log.Printf("failed to download shard %d from %s: %v", index, node.NodeAddress, err)
+				readers[index] = nil // Mark as failed
+				return nil
+			}
+
+			mu.Lock()
+			readers[index] = resp.Body
+			successfulDownloads++
+			mu.Unlock()
+			return nil
+		})
 	}
 
-	errs := make([]error, len(nodes))
-	for range nodes {
-		res := <-resultCh
-		if res.err != nil {
-			errs[res.idx] = res.err
-			// Also close any readers that might have been opened before the error
-			if res.reader != nil {
-				res.reader.Close()
+	// Wait for all downloads to complete or one to fail.
+	// Since we return nil in goroutines, this will wait for all to finish.
+	if err := eg.Wait(); err != nil {
+		// This part might be unreachable if goroutines always return nil.
+		// But it's good practice.
+		for _, r := range readers {
+			if r, ok := r.(io.Closer); ok && r != nil {
+				r.Close()
 			}
-			continue
 		}
-		readers[res.idx] = res.reader
-	}
-
-	errCount := 0
-	for _, e := range errs {
-		if e != nil {
-			errCount++
-		}
+		return nil, err
 	}
 
 	// If too many shards failed, return error.
-	if len(nodes)-errCount < conf.DataShard {
-		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, len(nodes)-errCount)
+	if successfulDownloads < conf.DataShard {
+		// Close any readers that were successfully opened.
+		for _, r := range readers {
+			if r, ok := r.(io.Closer); ok && r != nil {
+				r.Close()
+			}
+		}
+		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, successfulDownloads)
 	}
 
 	erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
@@ -139,15 +185,6 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	body := params.Body
 
-	conf, err := c.scheduler.getErasureConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
-	if err != nil {
-		return nil, err
-	}
-
 	size, ok := getBodySize(body)
 	if !ok {
 		if params.ContentLength == nil {
@@ -157,88 +194,150 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 		}
 	}
 
-	nodes, err := c.scheduler.getUploadNodes(c.region, *params.Bucket, *params.Key, size)
+	resp, err := c.scheduler.getUploadNodes(c.region, *params.Bucket, *params.Key, size)
 	if err != nil {
 		return nil, fmt.Errorf("get upload node:%w", err)
 	}
-	log.Printf("get nodes:%v", nodes)
-	if len(nodes) == 0 || len(nodes) != conf.DataShard+conf.ParityShard {
-		return nil, fmt.Errorf("node count not match")
+
+	nodes := resp.Shards
+	conf := resp.Config
+
+	shardNumber := conf.DataShard + conf.ParityShard
+
+	if len(nodes) == 0 {
+		return nil, errors.New("insufficient number of nodes")
 	}
 
-	errs := make([]error, len(nodes))
-	writers := make([]io.Writer, len(nodes))
-	shards := make([]shard, len(nodes))
-	wg := sync.WaitGroup{}
-	for i, n := range nodes {
-		wg.Add(1)
+	uploadNodes := nodes[:shardNumber]
+	backupNodes := nodes[shardNumber:]
+	fmt.Println(uploadNodes, backupNodes)
+
+	writers := make([]io.Writer, shardNumber)
+	shards := make([]shard, shardNumber)
+
+	var failedUploads int
+	var mu sync.Mutex
+
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	for i, n := range uploadNodes {
 		r, w := io.Pipe()
 		writers[i] = w
-		go func(ctx context.Context, index int, n node, r io.ReadCloser) {
-			endpoint := fmt.Sprintf("http://%s:%d", n.Host, n.Port)
-			defer func() {
-				wg.Done()
-				r.Close()
-				shards[index] = shard{
-					Index:       index + 1,
-					Size:        0,
-					Hash:        "",
-					HashType:    "",
-					NodeID:      n.ID,
-					NodeAddress: endpoint,
+
+		index := i
+		node := n
+
+		eg.Go(func() error {
+			reader := r
+			hasher := md5.New()
+			teeReader := io.TeeReader(reader, hasher)
+			defer reader.Close()
+			endpoint := fmt.Sprintf("http://%s:%d", node.Host, node.Port)
+			newParams := clonePutObjectInputWithNewBody(params, teeReader)
+			uploader := manager.NewUploader(c.getS3Client(endpoint, optFns...))
+
+			var out *manager.UploadOutput
+
+			// The operation to perform, wrapped in a function.
+			operation := func() error {
+				// If context is canceled, stop trying.
+				if egCtx.Err() != nil {
+					return backoff.Permanent(egCtx.Err())
 				}
-			}()
-			newParams := clonePutObjectInputWithNewBody(params, r)
-			out, err := manager.NewUploader(c.getS3Client(endpoint, optFns...)).Upload(ctx, &newParams)
-			log.Println(out, fmt.Errorf("shard %d upload err:%w", i+1, err))
-			if err != nil {
-				errs[index] = fmt.Errorf("shard %d upload err:%w", i+1, err)
-				return
+				var err error
+				out, err = uploader.Upload(egCtx, &newParams)
+				return err
 			}
-		}(ctx, i, n, r)
+
+			// Define the backoff strategy.
+			bo := backoff.NewExponentialBackOff()
+			bo.MaxElapsedTime = c.cfg.MaxRetryElapsedTime
+			shards[index] = shard{
+				Index:       index + 1,
+				Size:        0,
+				Hash:        "",
+				HashType:    "",
+				NodeID:      node.ID,
+				NodeAddress: endpoint,
+			}
+			err := backoff.Retry(operation, backoff.WithContext(bo, egCtx))
+
+			if err != nil {
+				log.Printf("shard %d upload failed after retries: %v", index+1, err)
+				mu.Lock()
+				failedUploads++
+				// Check if we have exceeded the fault tolerance
+				if failedUploads > conf.ParityShard {
+					mu.Unlock()
+					return fmt.Errorf("too many shards failed to upload, failed: %d, parity: %d", failedUploads, conf.ParityShard)
+				}
+				mu.Unlock()
+				return nil // Don't return the upload error itself, but allow the group to continue.
+			}
+
+			log.Println(out)
+			hash := hex.EncodeToString(hasher.Sum(nil))
+			shards[index].Size = 0
+			shards[index].Hash = hash
+			shards[index].HashType = "md5"
+			return nil
+		})
 	}
 
-	_, err = erasure.Encode(ctx, body, writers)
-	if err != nil {
+	hasher := md5.New()
+	teeReader := io.TeeReader(body, hasher)
+
+	eg.Go(func() error {
+		defer func() {
+			for _, w := range writers {
+				if c, ok := w.(io.Closer); ok {
+					c.Close()
+				}
+			}
+		}()
+		if conf.Encode {
+			erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
+			if err != nil {
+				return err
+			}
+			_, err = erasure.Encode(egCtx, teeReader, writers)
+			return err
+		} else {
+			_, err := io.Copy(io.MultiWriter(writers...), teeReader)
+			return err
+		}
+	})
+
+	// After all operations, check the final state.
+	// Note: eg.Wait() will return the "too many shards failed" error if it was triggered.
+	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
 
-	for _, w := range writers {
-		if err := w.(io.Closer).Close(); err != nil {
-			log.Printf("failed to close writer: %v", err)
-		}
+	if failedUploads > conf.ParityShard {
+		return nil, fmt.Errorf("not enough shards uploaded successfully, required: %d, got: %d", conf.DataShard, shardNumber-failedUploads)
 	}
-	wg.Wait()
+	hash := hex.EncodeToString(hasher.Sum(nil))
+
 	if err := c.scheduler.commitObject(ctx, commitObjectReq{
+		Config: erasureConfig{
+			Encode:      conf.Encode,
+			DataShard:   conf.DataShard,
+			ParityShard: conf.ParityShard,
+		},
 		Bucket:    *params.Bucket,
 		Key:       *params.Key,
 		Size:      uint64(size),
-		Hash:      "",
-		HashType:  "",
+		Hash:      hash,
+		HashType:  "md5",
 		ShardList: shards,
 	}); err != nil {
 		return nil, err
 	}
 
 	return &s3.PutObjectOutput{
-		BucketKeyEnabled:        new(bool),
-		ChecksumCRC32:           new(string),
-		ChecksumCRC32C:          new(string),
-		ChecksumCRC64NVME:       new(string),
-		ChecksumSHA1:            new(string),
-		ChecksumSHA256:          new(string),
-		ChecksumType:            "",
-		ETag:                    new(string),
-		Expiration:              new(string),
-		RequestCharged:          "",
-		SSECustomerAlgorithm:    new(string),
-		SSECustomerKeyMD5:       new(string),
-		SSEKMSEncryptionContext: new(string),
-		SSEKMSKeyId:             new(string),
-		ServerSideEncryption:    "",
-		Size:                    new(int64),
-		VersionId:               new(string),
-		ResultMetadata:          middleware.Metadata{},
+		ETag: &hash,
+		// VersionId is not provided by the current scheduler commit response
 	}, nil
 }
 

@@ -20,8 +20,9 @@ type response[T any] struct {
 }
 
 type erasureConfig struct {
-	DataShard   int `json:"dataShard"`
-	ParityShard int `json:"parityShard"`
+	Encode      bool `json:"encode"`
+	DataShard   int  `json:"dataShard"`
+	ParityShard int  `json:"parityShard"`
 }
 
 type node struct {
@@ -30,17 +31,19 @@ type node struct {
 	Port int    `json:"port"`
 }
 
-type endpoint struct {
-	Shards []node `json:"shards"`
+type uploadNodesResponse struct {
+	Shards []node        `json:"shards"`
+	Config erasureConfig `json:"config"`
 }
 
 type commitObjectReq struct {
-	Bucket    string  `json:"bucket"`
-	Key       string  `json:"key"`
-	Size      uint64  `json:"size"`
-	Hash      string  `json:"hash"`
-	HashType  string  `json:"hashType"`
-	ShardList []shard `json:"shardList"`
+	Config    erasureConfig `json:"config"`
+	Bucket    string        `json:"bucket"`
+	Key       string        `json:"key"`
+	Size      uint64        `json:"size"`
+	Hash      string        `json:"hash"`
+	HashType  string        `json:"hashType"`
+	ShardList []shard       `json:"shardList"`
 }
 
 type shard struct {
@@ -52,8 +55,9 @@ type shard struct {
 	NodeAddress string `json:"nodeAddress"`
 }
 
-type shards struct {
-	Shards []shard `json:"shards"`
+type downloadNodesResponse struct {
+	Shards []shard       `json:"shards"`
+	Config erasureConfig `json:"config"`
 }
 
 type scheduler struct {
@@ -70,22 +74,7 @@ func newScheduler(baseUrl string) *scheduler {
 	}
 }
 
-func (s *scheduler) getErasureConfig(ctx context.Context) (e erasureConfig, err error) {
-	u := s.baseUrl + "/v1/config"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return e, err
-	}
-	resp, err := s.cli.Do(req)
-	if err != nil {
-		return e, err
-	}
-	defer resp.Body.Close()
-
-	return parseBody[erasureConfig](resp.Body)
-}
-
-func (s *scheduler) getDownloadNodes(region, bucket, key string) ([]shard, error) {
+func (s *scheduler) getDownloadNodes(region, bucket, key string) (*downloadNodesResponse, error) {
 	query := url.Values{}
 	query.Add("region", region)
 	query.Add("bucket", bucket)
@@ -97,14 +86,14 @@ func (s *scheduler) getDownloadNodes(region, bucket, key string) ([]shard, error
 	}
 	defer resp.Body.Close()
 
-	d, err := parseBody[shards](resp.Body)
+	d, err := parseBody[downloadNodesResponse](resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	return d.Shards, nil
+	return &d, nil
 }
 
-func (s *scheduler) getUploadNodes(region, bucket, key string, size int64) ([]node, error) {
+func (s *scheduler) getUploadNodes(region, bucket, key string, size int64) (*uploadNodesResponse, error) {
 	query := url.Values{}
 	query.Add("region", region)
 	query.Add("bucket", bucket)
@@ -117,11 +106,11 @@ func (s *scheduler) getUploadNodes(region, bucket, key string, size int64) ([]no
 	}
 	defer resp.Body.Close()
 
-	d, err := parseBody[endpoint](resp.Body)
+	d, err := parseBody[uploadNodesResponse](resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	return d.Shards, nil
+	return &d, nil
 }
 
 func (s *scheduler) commitObject(ctx context.Context, req commitObjectReq) error {
