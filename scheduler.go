@@ -46,13 +46,20 @@ type commitObjectReq struct {
 	ShardList []shard       `json:"shardList"`
 }
 
+const (
+	StatusSuccess = 1
+	StatusFailed  = 2
+)
+
 type shard struct {
 	Index       int    `json:"index"`
+	Status      int    `json:"status"`
 	Size        uint64 `json:"size"`
 	Hash        string `json:"hash"`
 	HashType    string `json:"hashType"`
 	NodeID      string `json:"nodeID"`
 	NodeAddress string `json:"nodeAddress"`
+	Message     string `json:"message"`
 }
 
 type downloadNodesResponse struct {

@@ -70,14 +70,6 @@ func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.C
 	return cli
 }
 
-func (c *Client) downloadWithoutEncode() {
-
-}
-
-func (c *Client) downloadWithEncode() {
-
-}
-
 func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	resp, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
 	if err != nil {
@@ -93,8 +85,8 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 		for _, node := range nodes {
 			cli := c.getS3Client(node.NodeAddress)
 			resp, err = cli.GetObject(ctx, params)
-			if err != nil {
-				continue
+			if err == nil {
+				return resp, err
 			}
 		}
 		return resp, err
@@ -257,12 +249,14 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 				Size:        0,
 				Hash:        "",
 				HashType:    "",
+				Status:      StatusFailed,
 				NodeID:      node.ID,
 				NodeAddress: endpoint,
 			}
 			err := backoff.Retry(operation, backoff.WithContext(bo, egCtx))
 
 			if err != nil {
+				shards[index].Message = err.Error()
 				log.Printf("shard %d upload failed after retries: %v", index+1, err)
 				mu.Lock()
 				failedUploads++
@@ -280,6 +274,7 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 			shards[index].Size = 0
 			shards[index].Hash = hash
 			shards[index].HashType = "md5"
+			shards[index].Status = StatusSuccess
 			return nil
 		})
 	}

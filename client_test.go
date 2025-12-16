@@ -15,12 +15,12 @@ import (
 
 func TestUpload(t *testing.T) {
 	cli := NewClient(Config{SchedulerURL: "http://192.168.0.30:8888"})
-	file, err := os.Open("tmp/file.txt")
+	file, err := os.Open("tmp/file")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bucket := "default"
-	key := "file.txt"
+	key := "file"
 	resp, err := cli.PutObject(t.Context(), &s3.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
@@ -78,7 +78,9 @@ func TestDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(f, resp.Body)
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		t.Fatal(err)
+	}
 	f.Close()
 	resp.Body.Close()
 
