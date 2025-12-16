@@ -14,7 +14,7 @@ import (
 )
 
 func TestUpload(t *testing.T) {
-	cli := NewClient(Config{SchedulerURL: "http://192.168.0.30:8888"})
+	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888", Region: "intranet"})
 	file, err := os.Open("tmp/file")
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +64,7 @@ func TestS3Upload(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	cli := NewClient(Config{SchedulerURL: "http://192.168.0.30:8888"})
+	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888"})
 	bucket := "default"
 	key := "file"
 	resp, err := cli.GetObject(t.Context(), &s3.GetObjectInput{
@@ -74,7 +74,7 @@ func TestDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Create("tmp/download")
+	f, err := os.Create("tmp/aaaa")
 	if err != nil {
 		t.Fatal(err)
 	}

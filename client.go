@@ -38,23 +38,20 @@ type Client struct {
 }
 
 type Config struct {
-	SchedulerURL        string
+	BaseEndpoint        string
 	Region              string
 	MaxRetryElapsedTime time.Duration
 }
 
 func NewClient(cfg Config) *Client {
-	if cfg.SchedulerURL == "" {
+	if cfg.BaseEndpoint == "" {
 		// Or return an error, for now, let's panic
 		panic("SchedulerURL must be set")
-	}
-	if cfg.Region == "" {
-		cfg.Region = "us-east-1"
 	}
 	if cfg.MaxRetryElapsedTime == 0 {
 		cfg.MaxRetryElapsedTime = time.Second
 	}
-	scheduler := newScheduler(cfg.SchedulerURL)
+	scheduler := newScheduler(cfg.BaseEndpoint)
 	return &Client{
 		region:    cfg.Region,
 		scheduler: scheduler,
@@ -70,15 +67,19 @@ func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.C
 	return cli
 }
 
+type result struct {
+	idx    int
+	reader io.ReadCloser
+	err    error
+}
+
 func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	resp, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
 	if err != nil {
 		return nil, err
 	}
-
 	nodes := resp.Shards
 	conf := resp.Config
-
 	if !conf.Encode {
 		var err error
 		var resp *s3.GetObjectOutput
@@ -92,56 +93,44 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 		return resp, err
 	}
 	readers := make([]io.Reader, len(nodes))
-	eg, egCtx := errgroup.WithContext(ctx)
-
-	// We still need to count successful downloads to see if we have enough shards.
-	var successfulDownloads int
-	var mu sync.Mutex
-
+	// Use a WaitGroup to wait for all goroutines to finish.
+	resultCh := make(chan result, len(nodes))
 	for i, node := range nodes {
-		index := i
-		node := node
-		eg.Go(func() error {
+		go func(index int, node shard) {
 			cli := c.getS3Client(node.NodeAddress)
-			resp, err := cli.GetObject(egCtx, params)
+			resp, err := cli.GetObject(ctx, params)
 			if err != nil {
-				// Don't return error here, just log it or mark this reader as nil.
-				// errgroup would cancel all other downloads.
-				log.Printf("failed to download shard %d from %s: %v", index, node.NodeAddress, err)
-				readers[index] = nil // Mark as failed
-				return nil
+				resultCh <- result{idx: index, err: err}
+				return
 			}
-
-			mu.Lock()
-			readers[index] = resp.Body
-			successfulDownloads++
-			mu.Unlock()
-			return nil
-		})
+			resultCh <- result{idx: index, reader: resp.Body}
+		}(i, node)
 	}
 
-	// Wait for all downloads to complete or one to fail.
-	// Since we return nil in goroutines, this will wait for all to finish.
-	if err := eg.Wait(); err != nil {
-		// This part might be unreachable if goroutines always return nil.
-		// But it's good practice.
-		for _, r := range readers {
-			if r, ok := r.(io.Closer); ok && r != nil {
-				r.Close()
+	errs := make([]error, len(nodes))
+	for range nodes {
+		res := <-resultCh
+		if res.err != nil {
+			errs[res.idx] = res.err
+			// Also close any readers that might have been opened before the error
+			if res.reader != nil {
+				res.reader.Close()
 			}
+			continue
 		}
-		return nil, err
+		readers[res.idx] = res.reader
+	}
+
+	errCount := 0
+	for _, e := range errs {
+		if e != nil {
+			errCount++
+		}
 	}
 
 	// If too many shards failed, return error.
-	if successfulDownloads < conf.DataShard {
-		// Close any readers that were successfully opened.
-		for _, r := range readers {
-			if r, ok := r.(io.Closer); ok && r != nil {
-				r.Close()
-			}
-		}
-		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, successfulDownloads)
+	if len(nodes)-errCount < conf.DataShard {
+		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, len(nodes)-errCount)
 	}
 
 	erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
