@@ -48,13 +48,13 @@ func TestS3Upload(t *testing.T) {
 	m := manager.NewUploader(s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String("http://127.0.0.1:9000")
 	}))
-	f, err := os.Open("tmp/file")
+	f, err := os.Open("tmp/file.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp, err := m.Upload(t.Context(), &s3.PutObjectInput{
 		Bucket: aws.String("mybucket"),
-		Key:    aws.String("file"),
+		Key:    aws.String("file.txt"),
 		Body:   f,
 	})
 	if err != nil {
@@ -64,7 +64,7 @@ func TestS3Upload(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888"})
+	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888", Region: "intranet"})
 	bucket := "default"
 	key := "file"
 	resp, err := cli.GetObject(t.Context(), &s3.GetObjectInput{

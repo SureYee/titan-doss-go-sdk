@@ -85,6 +85,8 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 		var resp *s3.GetObjectOutput
 		for _, node := range nodes {
 			cli := c.getS3Client(node.NodeAddress)
+			params.Bucket = &node.Bucket
+			params.Key = &node.Key
 			resp, err = cli.GetObject(ctx, params)
 			if err == nil {
 				return resp, err
@@ -98,8 +100,12 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 	for i, node := range nodes {
 		go func(index int, node shard) {
 			cli := c.getS3Client(node.NodeAddress)
-			resp, err := cli.GetObject(ctx, params)
+			newParams := *params
+			newParams.Bucket = aws.String(node.Bucket)
+			newParams.Key = aws.String(node.Key)
+			resp, err := cli.GetObject(ctx, &newParams)
 			if err != nil {
+				log.Printf("GetObject successful: %v", err)
 				resultCh <- result{idx: index, err: err}
 				return
 			}
@@ -214,7 +220,11 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 			teeReader := io.TeeReader(reader, hasher)
 			defer reader.Close()
 			endpoint := fmt.Sprintf("http://%s:%d", node.Host, node.Port)
-			newParams := clonePutObjectInputWithNewBody(params, teeReader)
+
+			newParams := *params
+			newParams.Body = teeReader
+			newParams.Bucket = aws.String(node.Bucket)
+			newParams.Key = aws.String(node.Key)
 			uploader := manager.NewUploader(c.getS3Client(endpoint, optFns...))
 
 			var out *manager.UploadOutput
@@ -241,6 +251,8 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 				Status:      StatusFailed,
 				NodeID:      node.ID,
 				NodeAddress: endpoint,
+				Bucket:      node.Bucket,
+				Key:         node.Key,
 			}
 			err := backoff.Retry(operation, backoff.WithContext(bo, egCtx))
 
@@ -323,52 +335,6 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 		ETag: &hash,
 		// VersionId is not provided by the current scheduler commit response
 	}, nil
-}
-
-func clonePutObjectInputWithNewBody(i *s3.PutObjectInput, body io.Reader) s3.PutObjectInput {
-	return s3.PutObjectInput{
-		Bucket:                    i.Bucket,
-		Key:                       i.Key,
-		ACL:                       i.ACL,
-		Body:                      body,
-		BucketKeyEnabled:          i.BucketKeyEnabled,
-		CacheControl:              i.CacheControl,
-		ChecksumAlgorithm:         i.ChecksumAlgorithm,
-		ChecksumCRC32:             i.ChecksumCRC32,
-		ChecksumCRC32C:            i.ChecksumCRC32C,
-		ChecksumCRC64NVME:         i.ChecksumCRC64NVME,
-		ChecksumSHA1:              i.ChecksumSHA1,
-		ChecksumSHA256:            i.ChecksumSHA256,
-		ContentDisposition:        i.ContentDisposition,
-		ContentEncoding:           i.ContentEncoding,
-		ContentLanguage:           i.ContentLanguage,
-		ContentLength:             nil,
-		ContentMD5:                nil,
-		ContentType:               nil,
-		ExpectedBucketOwner:       i.ExpectedBucketOwner,
-		Expires:                   i.Expires,
-		GrantFullControl:          i.GrantFullControl,
-		GrantRead:                 i.GrantRead,
-		GrantReadACP:              i.GrantReadACP,
-		GrantWriteACP:             i.GrantWriteACP,
-		IfMatch:                   i.IfMatch,
-		IfNoneMatch:               i.IfNoneMatch,
-		Metadata:                  i.Metadata,
-		ObjectLockLegalHoldStatus: i.ObjectLockLegalHoldStatus,
-		ObjectLockMode:            i.ObjectLockMode,
-		ObjectLockRetainUntilDate: i.ObjectLockRetainUntilDate,
-		RequestPayer:              i.RequestPayer,
-		SSECustomerAlgorithm:      i.SSECustomerAlgorithm,
-		SSECustomerKey:            i.SSECustomerKey,
-		SSECustomerKeyMD5:         i.SSECustomerKeyMD5,
-		SSEKMSEncryptionContext:   i.SSEKMSEncryptionContext,
-		SSEKMSKeyId:               i.SSEKMSKeyId,
-		ServerSideEncryption:      i.ServerSideEncryption,
-		StorageClass:              i.StorageClass,
-		Tagging:                   i.Tagging,
-		WebsiteRedirectLocation:   i.WebsiteRedirectLocation,
-		WriteOffsetBytes:          i.WriteOffsetBytes,
-	}
 }
 
 func getBodySize(body io.Reader) (int64, bool) {

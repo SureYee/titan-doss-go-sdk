@@ -26,9 +26,11 @@ type erasureConfig struct {
 }
 
 type node struct {
-	ID   string `json:"id"`
-	Host string `json:"host"`
-	Port int    `json:"port"`
+	ID     string `json:"id"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
 }
 
 type uploadNodesResponse struct {
@@ -60,6 +62,8 @@ type shard struct {
 	NodeID      string `json:"nodeID"`
 	NodeAddress string `json:"nodeAddress"`
 	Message     string `json:"message"`
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
 }
 
 type downloadNodesResponse struct {
