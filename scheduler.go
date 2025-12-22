@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"time"
@@ -66,7 +65,14 @@ type shard struct {
 	Key         string `json:"key"`
 }
 
+type object struct {
+	Size     int64  `json:"size"`
+	Hash     string `json:"hash"`
+	HashType string `json:"hashType"`
+}
+
 type downloadNodesResponse struct {
+	Object object        `json:"fileinfo"`
 	Shards []shard       `json:"shards"`
 	Config erasureConfig `json:"config"`
 }
@@ -136,8 +142,6 @@ func (s *scheduler) commitObject(ctx context.Context, req commitObjectReq) error
 		return fmt.Errorf("new request error:%w", err)
 	}
 	r.Header.Set("Content-Type", "application/json")
-	d, _ := httputil.DumpRequest(r, true)
-	fmt.Println(string(d))
 
 	resp, err := s.cli.Do(r)
 	if err != nil {
