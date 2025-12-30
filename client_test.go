@@ -14,17 +14,32 @@ import (
 )
 
 func TestUpload(t *testing.T) {
-	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888", Region: "intranet"})
+	cli := NewClient(Config{BaseEndpoint: "https://doss-api-storage-dev.titannet.io/api/gateway", Region: "cn"})
 	file, err := os.Open("tmp/file")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer file.Close()
+	fileinfo, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentLength := fileinfo.Size()
+	// pr := NewProgressReader(file, time.Second)
+	// go func() {
+	// 	var total uint64
+	// 	for n := range pr.N() {
+	// 		t.Logf("upload speed %s/s", humanize.Bytes(n-total))
+	// 		total = n
+	// 	}
+	// }()
 	bucket := "default"
 	key := "file"
 	resp, err := cli.PutObject(t.Context(), &s3.PutObjectInput{
-		Bucket: &bucket,
-		Key:    &key,
-		Body:   file,
+		Bucket:        &bucket,
+		Key:           &key,
+		Body:          file,
+		ContentLength: &contentLength,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +79,7 @@ func TestS3Upload(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	cli := NewClient(Config{BaseEndpoint: "http://192.168.0.30:8888", Region: "intranet"})
+	cli := NewClient(Config{BaseEndpoint: "https://doss-api-storage-dev.titannet.io/api/gateway", Region: "intranet"})
 	bucket := "default"
 	key := "file"
 	resp, err := cli.GetObject(t.Context(), &s3.GetObjectInput{

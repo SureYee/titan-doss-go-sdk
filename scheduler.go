@@ -52,6 +52,10 @@ const (
 	StatusFailed  = 2
 )
 
+const (
+	V1_DownloadNodes = "/v1/download-nodes"
+)
+
 type shard struct {
 	Index       int    `json:"index"`
 	Status      int    `json:"status"`
@@ -96,7 +100,7 @@ func (s *scheduler) getDownloadNodes(region, bucket, key string) (*downloadNodes
 	query.Add("region", region)
 	query.Add("bucket", bucket)
 	query.Add("key", key)
-	u := s.baseUrl + "/v1/download-nodes?" + query.Encode()
+	u := s.baseUrl + V1_DownloadNodes + "?" + query.Encode()
 	resp, err := s.cli.Get(u)
 	if err != nil {
 		return nil, err

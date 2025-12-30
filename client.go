@@ -111,7 +111,7 @@ func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFn
 				resultCh <- result{idx: index, err: err}
 				return
 			}
-			resultCh <- result{idx: index, reader: ProgressReader(resp.Body, time.Now())}
+			resultCh <- result{idx: index, reader: resp.Body}
 		}(i, node)
 	}
 
