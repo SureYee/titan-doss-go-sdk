@@ -4,37 +4,35 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/cbergoon/merkletree"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/dustin/go-humanize"
-	"github.com/titan/doss-go-sdk/internal"
+	"github.com/klauspost/reedsolomon"
+	internal "github.com/titan/doss-go-sdk/internal/erasure"
+	"github.com/titan/doss-go-sdk/internal/scheduler"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
 	defaultBlockSize int64 = 1 << 20
 )
 
-const (
-	CodeSuccess = 0
-)
-
 type Client struct {
+	encoder   reedsolomon.Encoder
 	region    string
-	scheduler *scheduler
+	scheduler *scheduler.Scheduler
 	cfg       Config
 }
 
@@ -52,7 +50,7 @@ func NewClient(cfg Config) *Client {
 	if cfg.MaxRetryElapsedTime == 0 {
 		cfg.MaxRetryElapsedTime = time.Second
 	}
-	scheduler := newScheduler(cfg.BaseEndpoint)
+	scheduler := scheduler.NewScheduler(cfg.BaseEndpoint)
 	return &Client{
 		region:    cfg.Region,
 		scheduler: scheduler,
@@ -74,129 +72,64 @@ type result struct {
 	err    error
 }
 
-func (c *Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	resp, err := c.scheduler.getDownloadNodes(c.region, *params.Bucket, *params.Key)
+func (c *Client) UploadFile(ctx context.Context, bucket, key string, file *os.File) (any, error) {
+	matched, err := c.preCheck(ctx, file, 256*1024)
 	if err != nil {
 		return nil, err
 	}
-	nodes := resp.Shards
-	conf := resp.Config
-	if !conf.Encode {
-		var err error
-		var resp *s3.GetObjectOutput
-		for _, node := range nodes {
-			cli := c.getS3Client(node.NodeAddress)
-			params.Bucket = &node.Bucket
-			params.Key = &node.Key
-			resp, err = cli.GetObject(ctx, params)
-			if err == nil {
-				return resp, err
-			}
-		}
-		return resp, err
-	}
-	readers := make([]io.Reader, len(nodes))
-	// Use a WaitGroup to wait for all goroutines to finish.
-	resultCh := make(chan result, len(nodes))
-	for i, node := range nodes {
-		go func(index int, node shard) {
-			log.Printf("开始从%s下载文件", node.NodeAddress)
-			cli := c.getS3Client(node.NodeAddress)
-			newParams := *params
-			newParams.Bucket = aws.String(node.Bucket)
-			newParams.Key = aws.String(node.Key)
-			resp, err := cli.GetObject(ctx, &newParams)
-			log.Printf("从%s下载文件完成", node.NodeAddress)
-			if err != nil {
-				resultCh <- result{idx: index, err: err}
-				return
-			}
-			resultCh <- result{idx: index, reader: resp.Body}
-		}(i, node)
-	}
-
-	errs := make([]error, len(nodes))
-	for range nodes {
-		res := <-resultCh
-		if res.err != nil {
-			errs[res.idx] = res.err
-			// Also close any readers that might have been opened before the error
-			if res.reader != nil {
-				res.reader.Close()
-			}
-			continue
-		}
-		readers[res.idx] = res.reader
-	}
-
-	errCount := 0
-	for _, e := range errs {
-		if e != nil {
-			errCount++
-		}
-	}
-
-	// If too many shards failed, return error.
-	if len(nodes)-errCount < conf.DataShard {
-		return nil, fmt.Errorf("too many shards failed to download, required: %d, available: %d", conf.DataShard, len(nodes)-errCount)
-	}
-
-	erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
-	if err != nil {
-		return nil, err
-	}
-
-	r, w := io.Pipe()
-
-	go func() {
-		// Close all readers and the writer when the goroutine finishes.
-		defer func() {
-			for _, r := range readers {
-				if r != nil {
-					r.(io.Closer).Close()
-				}
-			}
-			w.Close()
-		}()
-
-		err := erasure.Decode(ctx, w, readers)
+	log.Printf("pre check:%v", matched)
+	if matched {
+		obj, matched, err := c.hashCheck(ctx, file, 4*1024*1024)
 		if err != nil {
-			// Propagate the error to the reader side.
-			w.CloseWithError(err)
+			return nil, err
 		}
-	}()
+		if matched {
+			return obj, nil
+		}
+	}
+	// 开始上传文件
+	log.Println("开始上传文件...")
+	_, err = c.upload(ctx, bucket, key, file)
 
-	return &s3.GetObjectOutput{
-		Body:          r,
-		ContentLength: &resp.Object.Size,
-	}, nil
+	return nil, err
 }
 
-func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	log.Println("开始上传文件")
-	body := params.Body
+// hashContent is a wrapper for a byte slice that satisfies the merkletree.Content interface.
+type hashContent struct {
+	hash []byte
+}
 
-	size, ok := getBodySize(body)
+// CalculateHash hashes the data using sha256.
+func (c hashContent) CalculateHash() ([]byte, error) {
+	return c.hash, nil
+}
+
+// Equals tests for equality of two Contents.
+func (c hashContent) Equals(other merkletree.Content) (bool, error) {
+	otherC, ok := other.(hashContent)
 	if !ok {
-		if params.ContentLength == nil {
-			return nil, errors.New("contentLength must be set when body can't get size")
-		} else {
-			size = *params.ContentLength
-		}
+		return false, errors.New("invalid content type")
 	}
-	log.Printf("获取到文件大小：%s", humanize.Bytes(uint64(size)))
-	resp, err := c.scheduler.getUploadNodes(c.region, *params.Bucket, *params.Key, size)
+	return bytes.Equal(c.hash, otherC.hash), nil
+}
+
+func (c *Client) upload(ctx context.Context, bucket string, key string, file *os.File) (any, error) {
+	// 获取节点列表
+	stat, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("get upload node:%w", err)
+		return nil, err
+	}
+
+	filesize := stat.Size()
+	resp, err := c.scheduler.GetUploadNodes(c.region, bucket, key, filesize)
+	if err != nil {
+		return nil, err
 	}
 
 	nodes := resp.Shards
 	conf := resp.Config
 	log.Printf("获取到上传节点数据：%#v", nodes)
 	log.Printf("获取到纠删码配置：%#v", conf)
-	conf.DataShard = 1
-	conf.ParityShard = 0
-	conf.Encode = false
 	shardNumber := conf.DataShard + conf.ParityShard
 
 	if len(nodes) == 0 {
@@ -207,7 +140,7 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 	// backupNodes := nodes[shardNumber:] // todo use backup nodes to increase reliability
 
 	writers := make([]io.Writer, shardNumber)
-	shards := make([]shard, shardNumber)
+	shards := make([]scheduler.Shard, shardNumber)
 
 	var failedUploads int
 	var mu sync.Mutex
@@ -226,14 +159,14 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 			hasher := md5.New()
 			teeReader := io.TeeReader(reader, hasher)
 			defer reader.Close()
-			endpoint := fmt.Sprintf("http://%s:%d", node.Host, node.Port)
+			endpoint := node.Endpoint
 			log.Printf("开始向节点%s上传分片", endpoint)
-			newParams := *params
-			newParams.Body = teeReader
-			newParams.Bucket = aws.String(node.Bucket)
-			newParams.Key = aws.String(node.Key)
-			uploader := manager.NewUploader(c.getS3Client(endpoint, optFns...))
-
+			params := s3.PutObjectInput{
+				Body:   teeReader,
+				Bucket: &node.Bucket,
+				Key:    &node.Key,
+			}
+			uploader := manager.NewUploader(c.getS3Client(endpoint))
 			// var out *manager.UploadOutput
 
 			// The operation to perform, wrapped in a function.
@@ -243,16 +176,16 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 					return backoff.Permanent(egCtx.Err())
 				}
 				var err error
-				_, err = uploader.Upload(egCtx, &newParams)
+				_, err = uploader.Upload(egCtx, &params)
 				return err
 			}
 
 			// Define the backoff strategy.
 			bo := backoff.NewExponentialBackOff()
 			bo.MaxElapsedTime = c.cfg.MaxRetryElapsedTime
-			shards[index] = shard{
+			shards[index] = scheduler.Shard{
 				Index:       index + 1,
-				Status:      StatusFailed,
+				Status:      scheduler.StatusFailed,
 				NodeID:      node.ID,
 				NodeAddress: endpoint,
 				Bucket:      node.Bucket,
@@ -279,14 +212,14 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 			shards[index].Size = 0
 			shards[index].Hash = hash
 			shards[index].HashType = "md5"
-			shards[index].Status = StatusSuccess
+			shards[index].Status = scheduler.StatusSuccess
 			log.Printf("向节点%s上传分片完成", endpoint)
 			return nil
 		})
 	}
 
 	hasher := md5.New()
-	teeReader := io.TeeReader(body, hasher)
+	teeReader := io.TeeReader(file, hasher)
 
 	eg.Go(func() error {
 		defer func() {
@@ -320,15 +253,15 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 	}
 	hash := hex.EncodeToString(hasher.Sum(nil))
 
-	if err := c.scheduler.commitObject(ctx, commitObjectReq{
-		Config: erasureConfig{
+	if err := c.scheduler.CommitObject(ctx, scheduler.CommitObjectReq{
+		Config: scheduler.ErasureConfig{
 			Encode:      conf.Encode,
 			DataShard:   conf.DataShard,
 			ParityShard: conf.ParityShard,
 		},
-		Bucket:    *params.Bucket,
-		Key:       *params.Key,
-		Size:      uint64(size),
+		Bucket:    bucket,
+		Key:       key,
+		Size:      uint64(filesize),
 		Hash:      hash,
 		HashType:  "md5",
 		ShardList: shards,
@@ -342,21 +275,130 @@ func (c *Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFn
 	}, nil
 }
 
-func getBodySize(body io.Reader) (int64, bool) {
-	switch v := body.(type) {
-	case *bytes.Buffer:
-		return int64(v.Len()), true
-	case *bytes.Reader:
-		return int64(v.Len()), true
-	case *strings.Reader:
-		return int64(v.Len()), true
-	case *os.File:
-		stat, err := v.Stat()
+func (c *Client) hashCheck(ctx context.Context, file *os.File, size int64) (object any, match bool, err error) {
+	// todo
+	// 根据size对文件进行分片，求叶子hash
+	// 计算roothash后，调用scheduler.HashCheck进行验证
+	defer file.Seek(0, io.SeekStart)
+
+	chunk := make([]byte, size)
+	var (
+		leafs     []merkletree.Content
+		leafHashs []scheduler.LeafHash
+	)
+
+	// 分片读取文件，计算每个分片的哈希
+	for i := int64(0); ; i++ {
+		// 每次读取一个分片
+		// 最后一个分片不足defaultBlockSize
+		n, err := file.Read(chunk)
 		if err != nil {
-			return 0, false
+			if err == io.EOF {
+				break
+			}
+			return nil, false, err
 		}
-		return stat.Size(), true
+		// 计算分片哈希
+		// chunk[:n] 是为了防止最后一个分片不足defaultBlockSize
+		hash := sha256.Sum256(chunk[:n])
+		h := make([]byte, sha256.Size)
+		copy(h, hash[:])
+		leafs = append(leafs, hashContent{hash: h})
+		leafHashs = append(leafHashs, scheduler.LeafHash{
+			Hash:  hex.EncodeToString(h),
+			Size:  uint64(n),
+			Index: i,
+		})
 	}
 
-	return 0, false
+	// 创建 Merkle Tree
+	tree, err := merkletree.NewTree(leafs)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// 计算根哈希
+	rootHash := hex.EncodeToString(tree.MerkleRoot())
+
+	// 调用调度器进行深度验证
+	return c.scheduler.HashCheck(ctx, scheduler.HashCheckReq{
+		RootHash: rootHash,
+		HashType: "sha256",
+		LeafHash: leafHashs,
+	})
+}
+
+// preCheck
+// hash预检
+func (c *Client) preCheck(ctx context.Context, file *os.File, size int64) (match bool, err error) {
+	// 重置文件指针, 读取文件结束后，需要将文件指针归零，否则会影响后续文件操作
+	defer file.Seek(0, io.SeekStart)
+
+	// 计算文件头部256KB的哈希
+	hasher := sha256.New()
+	// 读取文件的前256KB
+	if _, err := io.CopyN(hasher, file, size); err != nil && err != io.EOF {
+		return false, err
+	}
+	stubHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// 调用调度器进行预检
+	return c.scheduler.PreCheck(ctx, scheduler.PreCheckReq{
+		Size:     size,
+		Hash:     stubHash,
+		HashType: "sha256",
+	})
+}
+
+func (c *Client) processAndUploadChunk(ctx context.Context, data []byte, chunkHash string, nodeAddrs []string) error {
+	// 1. 纠删码切片 (注意：此处数据已在内存中)
+	// Split 会将 data 划分为 K 个分片，并预留 M 个空位
+	shards, err := c.encoder.Split(data)
+	if err != nil {
+		return err
+	}
+
+	// 2. 计算校验位 (填充 shards 中的后 M 个分片)
+	if err := c.encoder.Encode(shards); err != nil {
+		return err
+	}
+
+	// 3. 并发上传 K+M 个分片
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(shards))
+
+	for i := 0; i < len(shards); i++ {
+		wg.Add(1)
+		go func(idx int, shardData []byte) {
+			defer wg.Done()
+
+			// 计算分片特定的 Hash (用于节点校验)
+			shardHash := calculateHash(shardData)
+
+			// 模拟发送到具体的存储节点
+			// nodeAddrs[idx] 是调度器分配给该分片的节点
+			if err := c.uploadToNode(ctx, nodeAddrs[idx], shardHash, shardData); err != nil {
+				errChan <- err
+			}
+		}(i, shards[i])
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// 检查是否有分片上传失败
+	if len(errChan) > 0 {
+		return <-errChan
+	}
+	return nil
+}
+
+func (c *Client) uploadToNode(ctx context.Context, nodeAddr, shardHash string, data []byte) error {
+
+	return nil
+}
+
+func calculateHash(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
 }

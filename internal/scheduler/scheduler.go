@@ -1,4 +1,4 @@
-package doss
+package scheduler
 
 import (
 	"bytes"
@@ -6,46 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"time"
 )
 
-type response[T any] struct {
-	Code int    `json:"code"`
-	Msg  string `json:"msg"`
-	Data T      `json:"data"`
-}
-
-type erasureConfig struct {
-	Encode      bool `json:"encode"`
-	DataShard   int  `json:"dataShard"`
-	ParityShard int  `json:"parityShard"`
-}
-
-type node struct {
-	ID     string `json:"id"`
-	Host   string `json:"host"`
-	Port   int    `json:"port"`
-	Bucket string `json:"bucket"`
-	Key    string `json:"key"`
-}
-
-type uploadNodesResponse struct {
-	Shards []node        `json:"shards"`
-	Config erasureConfig `json:"config"`
-}
-
-type commitObjectReq struct {
-	Config    erasureConfig `json:"config"`
-	Bucket    string        `json:"bucket"`
-	Key       string        `json:"key"`
-	Size      uint64        `json:"size"`
-	Hash      string        `json:"hash"`
-	HashType  string        `json:"hashType"`
-	ShardList []shard       `json:"shardList"`
-}
+const (
+	CodeSuccess = 0
+)
 
 const (
 	StatusSuccess = 1
@@ -56,7 +27,7 @@ const (
 	V1_DownloadNodes = "/v1/download-nodes"
 )
 
-type shard struct {
+type Shard struct {
 	Index       int    `json:"index"`
 	Status      int    `json:"status"`
 	Size        uint64 `json:"size"`
@@ -77,17 +48,17 @@ type object struct {
 
 type downloadNodesResponse struct {
 	Object object        `json:"fileinfo"`
-	Shards []shard       `json:"shards"`
-	Config erasureConfig `json:"config"`
+	Shards []Shard       `json:"shards"`
+	Config ErasureConfig `json:"config"`
 }
 
-type scheduler struct {
+type Scheduler struct {
 	baseUrl string
 	cli     http.Client
 }
 
-func newScheduler(baseUrl string) *scheduler {
-	return &scheduler{
+func NewScheduler(baseUrl string) *Scheduler {
+	return &Scheduler{
 		baseUrl: baseUrl,
 		cli: http.Client{
 			Timeout: 30 * time.Second,
@@ -95,7 +66,7 @@ func newScheduler(baseUrl string) *scheduler {
 	}
 }
 
-func (s *scheduler) getDownloadNodes(region, bucket, key string) (*downloadNodesResponse, error) {
+func (s *Scheduler) GetDownloadNodes(region, bucket, key string) (*downloadNodesResponse, error) {
 	query := url.Values{}
 	query.Add("region", region)
 	query.Add("bucket", bucket)
@@ -114,7 +85,7 @@ func (s *scheduler) getDownloadNodes(region, bucket, key string) (*downloadNodes
 	return &d, nil
 }
 
-func (s *scheduler) getUploadNodes(region, bucket, key string, size int64) (*uploadNodesResponse, error) {
+func (s *Scheduler) GetUploadNodes(region, bucket, key string, size int64) (*UploadNodesResponse, error) {
 	query := url.Values{}
 	query.Add("region", region)
 	query.Add("bucket", bucket)
@@ -127,14 +98,14 @@ func (s *scheduler) getUploadNodes(region, bucket, key string, size int64) (*upl
 	}
 	defer resp.Body.Close()
 
-	d, err := parseBody[uploadNodesResponse](resp.Body)
+	d, err := parseBody[UploadNodesResponse](resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	return &d, nil
 }
 
-func (s *scheduler) commitObject(ctx context.Context, req commitObjectReq) error {
+func (s *Scheduler) CommitObject(ctx context.Context, req CommitObjectReq) error {
 	u := s.baseUrl + "/v1/commit-object"
 	body := bytes.NewBuffer(nil)
 	err := json.NewEncoder(body).Encode(req)
@@ -160,8 +131,58 @@ func (s *scheduler) commitObject(ctx context.Context, req commitObjectReq) error
 
 }
 
+// PreCheck
+// 预检
+func (s *Scheduler) PreCheck(ctx context.Context, req PreCheckReq) (match bool, err error) {
+	//
+	buf := bytes.NewBuffer(nil)
+	if err := json.NewEncoder(buf).Encode(req); err != nil {
+		return false, err
+	}
+	u := s.baseUrl + "/v1/pre-check-hash"
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u, buf)
+	if err != nil {
+		return false, err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	rb, _ := httputil.DumpRequest(r, true)
+	log.Printf("precheck request:%s", rb)
+	resp, err := s.cli.Do(r)
+	if err != nil {
+		return false, err
+	}
+	b, _ := httputil.DumpResponse(resp, true)
+	log.Printf("precheck response:%s", b)
+	defer resp.Body.Close()
+
+	d, err := parseBody[PreCheckHashResponse](resp.Body)
+	if err != nil {
+		return false, err
+	}
+	return d.Match, nil
+}
+
+func (s *Scheduler) HashCheck(ctx context.Context, req HashCheckReq) (object any, match bool, err error) {
+	buf := bytes.NewBuffer(nil)
+	if err := json.NewEncoder(buf).Encode(req); err != nil {
+		return nil, false, err
+	}
+	u := s.baseUrl + "/v1/check-hash"
+	resp, err := s.cli.Post(u, "application/json", buf)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+
+	d, err := parseBody[PreCheckHashResponse](resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+	return nil, d.Match, nil
+}
+
 func parseBody[T any](body io.Reader) (t T, err error) {
-	var resp response[T]
+	var resp Response[T]
 	err = json.NewDecoder(body).Decode(&resp)
 	if err != nil {
 		return t, err
