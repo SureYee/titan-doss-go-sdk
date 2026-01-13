@@ -15,12 +15,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/cbergoon/merkletree"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/klauspost/reedsolomon"
-	internal "github.com/titan/doss-go-sdk/internal/erasure"
+	"github.com/titan/doss-go-sdk/internal/erasure"
+	"github.com/titan/doss-go-sdk/internal/manager"
 	"github.com/titan/doss-go-sdk/internal/scheduler"
 	"golang.org/x/sync/errgroup"
 )
@@ -75,15 +76,19 @@ type result struct {
 func (c *Client) UploadFile(ctx context.Context, bucket, key string, file *os.File) (any, error) {
 	matched, err := c.preCheck(ctx, file, 256*1024)
 	if err != nil {
+		log.Printf("预检错误：%s", err)
 		return nil, err
 	}
 	log.Printf("pre check:%v", matched)
 	if matched {
+		log.Printf("预检匹配成功")
 		obj, matched, err := c.hashCheck(ctx, file, 4*1024*1024)
 		if err != nil {
+			log.Printf("Hash检测错误：%s", err)
 			return nil, err
 		}
 		if matched {
+			log.Printf("Hash检测匹配成功")
 			return obj, nil
 		}
 	}
@@ -123,19 +128,16 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 	filesize := stat.Size()
 	resp, err := c.scheduler.GetUploadNodes(c.region, bucket, key, filesize)
 	if err != nil {
+		log.Printf("获取上传节点列表失败:%s", err)
 		return nil, err
 	}
 
-	nodes := resp.Shards
+	nodes := resp.List
 	conf := resp.Config
 	log.Printf("获取到上传节点数据：%#v", nodes)
 	log.Printf("获取到纠删码配置：%#v", conf)
+
 	shardNumber := conf.DataShard + conf.ParityShard
-
-	if len(nodes) == 0 {
-		return nil, errors.New("insufficient number of nodes")
-	}
-
 	uploadNodes := nodes[:shardNumber]
 	// backupNodes := nodes[shardNumber:] // todo use backup nodes to increase reliability
 
@@ -159,15 +161,9 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 			hasher := md5.New()
 			teeReader := io.TeeReader(reader, hasher)
 			defer reader.Close()
-			endpoint := node.Endpoint
+			endpoint := node.Presigned.Url
 			log.Printf("开始向节点%s上传分片", endpoint)
-			params := s3.PutObjectInput{
-				Body:   teeReader,
-				Bucket: &node.Bucket,
-				Key:    &node.Key,
-			}
-			uploader := manager.NewUploader(c.getS3Client(endpoint))
-			// var out *manager.UploadOutput
+			uploader := manager.NewUploader()
 
 			// The operation to perform, wrapped in a function.
 			operation := func() error {
@@ -175,9 +171,11 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 				if egCtx.Err() != nil {
 					return backoff.Permanent(egCtx.Err())
 				}
-				var err error
-				_, err = uploader.Upload(egCtx, &params)
-				return err
+				return uploader.Upload(egCtx, &v4.PresignedHTTPRequest{
+					URL:          node.Presigned.Url,
+					Method:       node.Presigned.Method,
+					SignedHeader: node.Presigned.Headers,
+				}, teeReader)
 			}
 
 			// Define the backoff strategy.
@@ -188,8 +186,8 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 				Status:      scheduler.StatusFailed,
 				NodeID:      node.ID,
 				NodeAddress: endpoint,
-				Bucket:      node.Bucket,
-				Key:         node.Key,
+				// Bucket:      node.Bucket,
+				// Key:         node.Key,
 			}
 			err := backoff.Retry(operation, backoff.WithContext(bo, egCtx))
 
@@ -230,7 +228,7 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 			}
 		}()
 		if conf.Encode {
-			erasure, err := internal.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
+			erasure, err := erasure.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
 			if err != nil {
 				return err
 			}
@@ -245,8 +243,10 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 	// After all operations, check the final state.
 	// Note: eg.Wait() will return the "too many shards failed" error if it was triggered.
 	if err := eg.Wait(); err != nil {
+		log.Printf("eg wait error:%s", err)
 		return nil, err
 	}
+	log.Println("文件上传成功")
 
 	if failedUploads > conf.ParityShard {
 		return nil, fmt.Errorf("not enough shards uploaded successfully, required: %d, got: %d", conf.DataShard, shardNumber-failedUploads)
@@ -259,13 +259,14 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 			DataShard:   conf.DataShard,
 			ParityShard: conf.ParityShard,
 		},
-		Bucket:    bucket,
-		Key:       key,
-		Size:      uint64(filesize),
+		Bucket: bucket,
+		Key:    key,
+		// Size:      uint64(filesize),
 		Hash:      hash,
 		HashType:  "md5",
 		ShardList: shards,
 	}); err != nil {
+		log.Printf("commit object error:%s", err)
 		return nil, err
 	}
 

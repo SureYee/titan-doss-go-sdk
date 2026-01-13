@@ -12,16 +12,20 @@ type ErasureConfig struct {
 	ParityShard int  `json:"parityShard"`
 }
 
-type Node struct {
-	ID       string `json:"id"`
-	Endpoint string `json:"endpoint"`
-	Bucket   string `json:"bucket"`
-	Key      string `json:"key"`
+type PresignedItem struct {
+	ID        string    `json:"id"`
+	Presigned Presigned `json:"presigned"`
+}
+
+type Presigned struct {
+	Url     string              `json:"url"`
+	Method  string              `json:"method"`
+	Headers map[string][]string `json:"headers"`
 }
 
 type UploadNodesResponse struct {
-	Shards []Node        `json:"shards"`
-	Config ErasureConfig `json:"config"`
+	List   []PresignedItem `json:"list"`
+	Config ErasureConfig   `json:"config"`
 }
 
 type CommitObjectReq struct {
@@ -54,4 +58,11 @@ type HashCheckReq struct {
 	RootHash string     `json:"rootHash"`
 	HashType string     `json:"hashType"`
 	LeafHash []LeafHash `json:"leafHash"`
+}
+
+type Part struct{}
+
+type PresignMultipartResponse struct {
+	ObjectID string `json:"objectId"`
+	Parts    []Part `json:"parts"`
 }
