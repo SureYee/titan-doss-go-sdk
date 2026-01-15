@@ -4,7 +4,6 @@ go 1.24.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.0
-	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.20.18
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.95.0
 	github.com/cbergoon/merkletree v0.2.0
 	github.com/cenkalti/backoff/v4 v4.3.0

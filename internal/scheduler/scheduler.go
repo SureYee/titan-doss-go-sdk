@@ -38,6 +38,7 @@ type Shard struct {
 	Message     string `json:"message"`
 	Bucket      string `json:"bucket"`
 	Key         string `json:"key"`
+	Etag        string `json:"etag"`
 }
 
 type object struct {
@@ -117,7 +118,8 @@ func (s *Scheduler) CommitObject(ctx context.Context, req CommitObjectReq) error
 		return fmt.Errorf("new request error:%w", err)
 	}
 	r.Header.Set("Content-Type", "application/json")
-
+	rb, _ := httputil.DumpRequest(r, true)
+	log.Printf("commit object:%s", rb)
 	resp, err := s.cli.Do(r)
 	if err != nil {
 		return fmt.Errorf("scheduler request error:%s", err)

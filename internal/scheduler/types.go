@@ -10,6 +10,8 @@ type ErasureConfig struct {
 	Encode      bool `json:"encode"`
 	DataShard   int  `json:"dataShard"`
 	ParityShard int  `json:"parityShard"`
+
+	Partsize int64 `json:"partsize"`
 }
 
 type PresignedItem struct {
@@ -24,8 +26,10 @@ type Presigned struct {
 }
 
 type UploadNodesResponse struct {
-	List   []PresignedItem `json:"list"`
-	Config ErasureConfig   `json:"config"`
+	UploadId string          `json:"uploadId"`
+	ObjectId string          `json:"objectId"`
+	List     []PresignedItem `json:"list"`
+	Config   ErasureConfig   `json:"config"`
 }
 
 type CommitObjectReq struct {
@@ -35,6 +39,10 @@ type CommitObjectReq struct {
 	Size      uint64        `json:"size"`
 	Hash      string        `json:"hash"`
 	HashType  string        `json:"hashType"`
+	PreHash   string        `json:"preHash"`
+	PreSize   uint64        `json:"preSize"`
+	UploadId  string        `json:"uploadId"`
+	ObjectId  string        `json:"objectId"`
 	ShardList []Shard       `json:"shardList"`
 }
 

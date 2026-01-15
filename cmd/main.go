@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	cli := doss.NewClient(doss.Config{BaseEndpoint: "http://127.0.0.1:8888", Region: "auto"})
+	cli := doss.NewClient(doss.Config{BaseEndpoint: "http://192.168.0.30:8888", Region: "auto"})
 	file, err := os.Open("tmp/file")
 	if err != nil {
 		log.Fatal(err)
