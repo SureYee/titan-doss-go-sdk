@@ -39,23 +39,8 @@ func NewUploader() *Uploader {
 	}
 }
 
-func (u *Uploader) Upload(ctx context.Context, presignResult *v4.PresignedHTTPRequest, r io.Reader, contentLength int64) (*Response, error) {
-	// 根据预签名请求创建一个新的 HTTP PUT 请求
-	// presignResult.URL 包含了完整的上传地址和查询参数
-	// presignResult.Method 指定了 HTTP 方法 (通常是 "PUT")
-	req, err := http.NewRequestWithContext(ctx, presignResult.Method, presignResult.URL, r)
-	if err != nil {
-		return nil, err
-	}
-	// 将预签名结果中的头部信息添加到请求中
-	// 这部分头部信息包含了认证和授权所需的重要字段，如 "X-Amz-..." 等
-	req.Header = presignResult.SignedHeader
-	req.ContentLength = contentLength
-	return upload(u, ctx, req)
-}
-
 func upload(u *Uploader, ctx context.Context, req *http.Request) (*Response, error) {
-
+	log.Printf("endpoint:%s", req.URL.String())
 	// 使用 Uploader 内嵌的 http.Client 发送请求
 	// u.Client 是一个标准的 Go HTTP 客户端
 	log.Println("开始调用文件上传")
@@ -77,7 +62,6 @@ func upload(u *Uploader, ctx context.Context, req *http.Request) (*Response, err
 		// 如果状态码不是 200 OK，读取响应体中的错误信息并返回一个错误
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Printf("get body:%s", body)
 			return nil, err
 		}
 		return nil, fmt.Errorf("upload failed with status code %d: %s", resp.StatusCode, string(body))
@@ -89,17 +73,19 @@ func upload(u *Uploader, ctx context.Context, req *http.Request) (*Response, err
 	}, nil
 }
 
+// UploadPart
+// 上传分片数据
 func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedHTTPRequest, r *os.File, filesize, partSize int64) ([]*PartResponse, error) {
 	g, ctx := errgroup.WithContext(ctx)
-	responses := make([]*PartResponse, 0, len(presignParts))
+	responses := make([]*PartResponse, len(presignParts))
 	lock := &sync.Mutex{}
 	for i, presignPart := range presignParts {
-		partNumber := i
+		partNumber := i + 1
 		presignPart := presignPart
 
 		g.Go(func() error {
 			// Create a section reader for the part.
-			offset := int64(partNumber) * partSize
+			offset := int64(i) * partSize
 			var contentLength = partSize
 			if filesize-offset < partSize {
 				contentLength = filesize - offset
@@ -107,24 +93,38 @@ func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedH
 			sectionReader := io.NewSectionReader(r, offset, partSize)
 			hasher := sha256.New()
 			r := io.TeeReader(sectionReader, hasher)
-			log.Println("contentLength:", contentLength)
-			resp, err := u.Upload(ctx, presignPart, r, contentLength)
+			resp, err := u.UploadFile(ctx, presignPart, r, contentLength)
 			if err != nil {
 				return err
 			}
 			hash := hex.EncodeToString(hasher.Sum(nil))
 			lock.Lock()
 			defer lock.Unlock()
-			responses = append(responses, &PartResponse{
-				PartNumber: partNumber + 1,
+			responses[i] = &PartResponse{
+				PartNumber: partNumber,
 				Etag:       resp.Header.Get("Etag"),
 				Hash:       hash,
 				HashType:   "sha256",
 				Size:       contentLength,
-			})
+			}
 			return nil
 		})
 	}
 
 	return responses, g.Wait()
+}
+
+func (u *Uploader) UploadFile(ctx context.Context, presignResult *v4.PresignedHTTPRequest, r io.Reader, contentLength int64) (*Response, error) {
+	// 根据预签名请求创建一个新的 HTTP PUT 请求
+	// presignResult.URL 包含了完整的上传地址和查询参数
+	// presignResult.Method 指定了 HTTP 方法 (通常是 "PUT")
+	req, err := http.NewRequestWithContext(ctx, presignResult.Method, presignResult.URL, r)
+	if err != nil {
+		return nil, err
+	}
+	// 将预签名结果中的头部信息添加到请求中
+	// 这部分头部信息包含了认证和授权所需的重要字段，如 "X-Amz-..." 等
+	req.Header = presignResult.SignedHeader
+	req.ContentLength = contentLength
+	return upload(u, ctx, req)
 }

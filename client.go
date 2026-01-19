@@ -79,10 +79,14 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key string, file *os.Fi
 		log.Printf("预检错误：%s", err)
 		return nil, err
 	}
+	tree, err := c.buildMerkleTree(file, 5*1024*1024)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("pre check:%v", matched)
 	if matched {
 		log.Printf("预检匹配成功")
-		obj, matched, err := c.hashCheck(ctx, file, 4*1024*1024)
+		obj, matched, err := c.hashCheck(ctx, bucket, key, tree)
 		if err != nil {
 			log.Printf("Hash检测错误：%s", err)
 			return nil, err
@@ -94,7 +98,7 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key string, file *os.Fi
 	}
 	// 开始上传文件
 	log.Println("开始上传文件...")
-	_, err = c.upload(ctx, bucket, key, file, prehash)
+	_, err = c.upload(ctx, bucket, key, file, tree, prehash)
 
 	return nil, err
 }
@@ -118,7 +122,7 @@ func (c hashContent) Equals(other merkletree.Content) (bool, error) {
 	return bytes.Equal(c.hash, otherC.hash), nil
 }
 
-func (c *Client) upload(ctx context.Context, bucket string, key string, file *os.File, prehash string) (any, error) {
+func (c *Client) upload(ctx context.Context, bucket string, key string, file *os.File, merkleTree *merkletree.MerkleTree, prehash string) (any, error) {
 	// 获取节点列表
 	stat, err := file.Stat()
 	if err != nil {
@@ -126,7 +130,12 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 	}
 
 	filesize := stat.Size()
-	resp, err := c.scheduler.GetUploadNodes(c.region, bucket, key, filesize)
+
+	filehash, err := hashFile(file)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.scheduler.GetUploadNodes("", "", filehash, filesize)
 	if err != nil {
 		log.Printf("获取上传节点列表失败:%s", err)
 		return nil, err
@@ -134,11 +143,13 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 
 	nodes := resp.List
 	conf := resp.Config
-	log.Printf("获取到上传节点数据：%#v", nodes)
 	log.Printf("获取到纠删码配置：%#v", conf)
 	uploader := manager.NewUploader()
-	if conf.Encode {
-		shardNumber := conf.DataShard + conf.ParityShard
+	if !conf.EnableMultipart {
+		var shardNumber int64 = 1
+		if conf.EnableErasure {
+			shardNumber = conf.ErasureDataShard + conf.ErasureParityShard
+		}
 		uploadNodes := nodes[:shardNumber]
 		// backupNodes := nodes[shardNumber:] // todo use backup nodes to increase reliability
 
@@ -172,11 +183,11 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 					if egCtx.Err() != nil {
 						return backoff.Permanent(egCtx.Err())
 					}
-					_, err := uploader.Upload(egCtx, &v4.PresignedHTTPRequest{
+					_, err := uploader.UploadFile(egCtx, &v4.PresignedHTTPRequest{
 						URL:          node.Presigned.Url,
 						Method:       node.Presigned.Method,
 						SignedHeader: node.Presigned.Headers,
-					}, teeReader, 0)
+					}, teeReader, filesize)
 					return err
 				}
 
@@ -194,14 +205,15 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 				err := backoff.Retry(operation, backoff.WithContext(bo, egCtx))
 
 				if err != nil {
+					log.Printf("upload error:%s", err.Error())
 					shards[index].Message = err.Error()
 					// log.Printf("shard %d upload failed after retries: %v", index+1, err)
 					mu.Lock()
 					failedUploads++
 					// Check if we have exceeded the fault tolerance
-					if failedUploads > conf.ParityShard {
+					if failedUploads > int(conf.ErasureParityShard) {
 						mu.Unlock()
-						return fmt.Errorf("too many shards failed to upload, failed: %d, parity: %d", failedUploads, conf.ParityShard)
+						return fmt.Errorf("too many shards failed to upload, failed: %d, parity: %d", failedUploads, conf.ErasureParityShard)
 					}
 					mu.Unlock()
 					return nil // Don't return the upload error itself, but allow the group to continue.
@@ -218,9 +230,6 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 			})
 		}
 
-		hasher := md5.New()
-		teeReader := io.TeeReader(file, hasher)
-
 		eg.Go(func() error {
 			defer func() {
 				for _, w := range writers {
@@ -229,15 +238,15 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 					}
 				}
 			}()
-			if conf.Encode {
-				erasure, err := erasure.NewErasure(ctx, conf.DataShard, conf.ParityShard, defaultBlockSize)
+			if conf.EnableErasure {
+				erasure, err := erasure.NewErasure(ctx, int(conf.ErasureDataShard), int(conf.ErasureParityShard), defaultBlockSize)
 				if err != nil {
 					return err
 				}
-				_, err = erasure.Encode(egCtx, teeReader, writers)
+				_, err = erasure.Encode(egCtx, file, writers)
 				return err
 			} else {
-				_, err := io.Copy(io.MultiWriter(writers...), teeReader)
+				_, err := io.Copy(io.MultiWriter(writers...), file)
 				return err
 			}
 		})
@@ -250,23 +259,26 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 		}
 		log.Println("文件上传成功")
 
-		if failedUploads > conf.ParityShard {
-			return nil, fmt.Errorf("not enough shards uploaded successfully, required: %d, got: %d", conf.DataShard, shardNumber-failedUploads)
+		if failedUploads > int(conf.ErasureParityShard) {
+			return nil, fmt.Errorf("not enough shards uploaded successfully, required: %d, got: %d", conf.ErasureDataShard, shardNumber-int64(failedUploads))
 		}
-		hash := hex.EncodeToString(hasher.Sum(nil))
 
 		if err := c.scheduler.CommitObject(ctx, scheduler.CommitObjectReq{
-			Config: scheduler.ErasureConfig{
-				Encode:      conf.Encode,
-				DataShard:   conf.DataShard,
-				ParityShard: conf.ParityShard,
+			MerkleHash: hex.EncodeToString(merkleTree.MerkleRoot()),
+			Config: scheduler.CommitConfig{
+				EnableMultipart:     conf.EnableMultipart,
+				MultipartChunkCount: conf.MultipartChunkCount,
 			},
-			Bucket: bucket,
-			Key:    key,
-			// Size:      uint64(filesize),
-			Hash:      hash,
-			HashType:  "md5",
+			Bucket:    bucket,
+			Key:       key,
+			Hash:      filehash,
+			HashType:  "sha256",
 			ShardList: shards,
+			Size:      uint64(filesize),
+			PreHash:   prehash,
+			PreSize:   256 * 1024,
+			UploadId:  "",
+			ObjectId:  "",
 		}); err != nil {
 			log.Printf("commit object error:%s", err)
 			return nil, err
@@ -284,18 +296,23 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 				SignedHeader: node.Presigned.Headers,
 			})
 		}
-		filehash, err := hashFile(file)
-		if err != nil {
-			return nil, err
-		}
-		resps, err := uploader.UploadPart(ctx, presignParts, file, filesize, conf.Partsize)
+		resps, err := uploader.UploadPart(ctx, presignParts, file, filesize, conf.MultipartChunkSize)
 		if err != nil {
 			return nil, err
 		}
 
 		shards := make([]scheduler.Shard, 0, len(resps))
+		var leafs []merkletree.Content
+
 		for _, resp := range resps {
-			log.Printf("Part %d ====> %s", resp.PartNumber, resp.Etag)
+			h, err := hex.DecodeString(resp.Hash)
+			if err != nil {
+				return nil, err
+			}
+			leafs = append(leafs, hashContent{
+				hash: h,
+			})
+			log.Printf("Part %d ====> %s", resp.PartNumber, resp.Hash)
 			shards = append(shards, scheduler.Shard{
 				Index:       resp.PartNumber,
 				Status:      scheduler.StatusSuccess,
@@ -310,12 +327,20 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 				Etag:        resp.Etag,
 			})
 		}
+		// 创建 Merkle Tree
+		tree, err := merkletree.NewTree(leafs)
+		if err != nil {
+			return nil, err
+		}
 
+		// 计算根哈希
+		rootHash := hex.EncodeToString(tree.MerkleRoot())
+		log.Printf("MerkleRoot ====> %s", rootHash)
 		if err := c.scheduler.CommitObject(ctx, scheduler.CommitObjectReq{
-			Config: scheduler.ErasureConfig{
-				Encode:      conf.Encode,
-				DataShard:   conf.DataShard,
-				ParityShard: conf.ParityShard,
+			MerkleHash: rootHash,
+			Config: scheduler.CommitConfig{
+				EnableMultipart:     conf.EnableMultipart,
+				MultipartChunkCount: conf.MultipartChunkCount,
 			},
 			Bucket: bucket,
 			Key:    key,
@@ -340,16 +365,11 @@ func (c *Client) upload(ctx context.Context, bucket string, key string, file *os
 	}, nil
 }
 
-func (c *Client) hashCheck(ctx context.Context, file *os.File, size int64) (object any, match bool, err error) {
-	// todo
-	// 根据size对文件进行分片，求叶子hash
-	// 计算roothash后，调用scheduler.HashCheck进行验证
+func (c *Client) buildMerkleTree(file *os.File, size int64) (*merkletree.MerkleTree, error) {
 	defer file.Seek(0, io.SeekStart)
-
 	chunk := make([]byte, size)
 	var (
-		leafs     []merkletree.Content
-		leafHashs []scheduler.LeafHash
+		leafs []merkletree.Content
 	)
 
 	// 分片读取文件，计算每个分片的哈希
@@ -361,7 +381,7 @@ func (c *Client) hashCheck(ctx context.Context, file *os.File, size int64) (obje
 			if err == io.EOF {
 				break
 			}
-			return nil, false, err
+			return nil, err
 		}
 		// 计算分片哈希
 		// chunk[:n] 是为了防止最后一个分片不足defaultBlockSize
@@ -369,28 +389,36 @@ func (c *Client) hashCheck(ctx context.Context, file *os.File, size int64) (obje
 		h := make([]byte, sha256.Size)
 		copy(h, hash[:])
 		leafs = append(leafs, hashContent{hash: h})
-		leafHashs = append(leafHashs, scheduler.LeafHash{
-			Hash:  hex.EncodeToString(h),
-			Size:  uint64(n),
-			Index: i,
-		})
 	}
 
 	// 创建 Merkle Tree
-	tree, err := merkletree.NewTree(leafs)
-	if err != nil {
-		return nil, false, err
+	return merkletree.NewTree(leafs)
+}
+
+func (c *Client) hashCheck(ctx context.Context, bucket, key string, merkletree *merkletree.MerkleTree) (obj any, match bool, err error) {
+	var (
+		leafHashs []scheduler.LeafHash
+	)
+
+	// 分片读取文件，计算每个分片的哈希
+	for i, leaf := range merkletree.Leafs {
+		leafHashs = append(leafHashs, scheduler.LeafHash{
+			Hash:  hex.EncodeToString(leaf.Hash),
+			Index: int64(i) + 1,
+		})
 	}
 
 	// 计算根哈希
-	rootHash := hex.EncodeToString(tree.MerkleRoot())
-
-	// 调用调度器进行深度验证
-	return c.scheduler.HashCheck(ctx, scheduler.HashCheckReq{
-		RootHash: rootHash,
-		HashType: "sha256",
+	rootHash := hex.EncodeToString(merkletree.MerkleRoot())
+	log.Printf("开始验证merkle hash:%s", rootHash)
+	obj, match, err = c.scheduler.HashCheck(ctx, scheduler.HashCheckReq{
+		Hash:     rootHash,
+		Bucket:   bucket,
+		Key:      key,
 		LeafHash: leafHashs,
 	})
+	// 调用调度器进行深度验证
+	return obj, match, err
 }
 
 // preCheck
@@ -406,7 +434,7 @@ func (c *Client) preCheck(ctx context.Context, file *os.File, size int64) (stubH
 		return "", false, err
 	}
 	stubHash = hex.EncodeToString(hasher.Sum(nil))
-
+	log.Printf("开始进行预检，hash:%s", stubHash)
 	// 调用调度器进行预检
 	match, err = c.scheduler.PreCheck(ctx, scheduler.PreCheckReq{
 		Size:     size,

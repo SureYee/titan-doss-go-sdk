@@ -6,12 +6,18 @@ type Response[T any] struct {
 	Data T      `json:"data"`
 }
 
-type ErasureConfig struct {
-	Encode      bool `json:"encode"`
-	DataShard   int  `json:"dataShard"`
-	ParityShard int  `json:"parityShard"`
+type UploadConfig struct {
+	EnableErasure       bool  `json:"enable"`
+	ErasureDataShard    int64 `json:"erasureDataShard"`
+	ErasureParityShard  int64 `json:"erasureParityShard"`
+	EnableMultipart     bool  `json:"enableMultipart"`
+	MultipartChunkSize  int64 `json:"multipartChunkSize"`
+	MultipartChunkCount int64 `json:"multipartChunkCount"`
+}
 
-	Partsize int64 `json:"partsize"`
+type CommitConfig struct {
+	EnableMultipart     bool  `json:"enableMultipart"`
+	MultipartChunkCount int64 `json:"multipartChunkCount"`
 }
 
 type PresignedItem struct {
@@ -29,21 +35,22 @@ type UploadNodesResponse struct {
 	UploadId string          `json:"uploadId"`
 	ObjectId string          `json:"objectId"`
 	List     []PresignedItem `json:"list"`
-	Config   ErasureConfig   `json:"config"`
+	Config   UploadConfig    `json:"config"`
 }
 
 type CommitObjectReq struct {
-	Config    ErasureConfig `json:"config"`
-	Bucket    string        `json:"bucket"`
-	Key       string        `json:"key"`
-	Size      uint64        `json:"size"`
-	Hash      string        `json:"hash"`
-	HashType  string        `json:"hashType"`
-	PreHash   string        `json:"preHash"`
-	PreSize   uint64        `json:"preSize"`
-	UploadId  string        `json:"uploadId"`
-	ObjectId  string        `json:"objectId"`
-	ShardList []Shard       `json:"shardList"`
+	Config     CommitConfig `json:"config"`
+	Bucket     string       `json:"bucket"`
+	Key        string       `json:"key"`
+	Size       uint64       `json:"size"`
+	MerkleHash string       `json:"merkleHash"`
+	Hash       string       `json:"hash"`
+	HashType   string       `json:"hashType"`
+	PreHash    string       `json:"preHash"`
+	PreSize    uint64       `json:"preSize"`
+	UploadId   string       `json:"uploadId"`
+	ObjectId   string       `json:"objectId"`
+	ShardList  []Shard      `json:"shardList"`
 }
 
 type PreCheckReq struct {
@@ -58,13 +65,13 @@ type PreCheckHashResponse struct {
 
 type LeafHash struct {
 	Hash  string `json:"hash"`
-	Size  uint64 `json:"size"`
 	Index int64  `json:"index"`
 }
 
 type HashCheckReq struct {
-	RootHash string     `json:"rootHash"`
-	HashType string     `json:"hashType"`
+	Hash     string     `json:"hash"`
+	Bucket   string     `json:"bucket"`
+	Key      string     `json:"key"`
 	LeafHash []LeafHash `json:"leafHash"`
 }
 

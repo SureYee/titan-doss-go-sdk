@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"time"
@@ -48,9 +46,9 @@ type object struct {
 }
 
 type downloadNodesResponse struct {
-	Object object        `json:"fileinfo"`
-	Shards []Shard       `json:"shards"`
-	Config ErasureConfig `json:"config"`
+	Object object  `json:"fileinfo"`
+	Shards []Shard `json:"shards"`
+	// Config  `json:"config"`
 }
 
 type Scheduler struct {
@@ -86,11 +84,11 @@ func (s *Scheduler) GetDownloadNodes(region, bucket, key string) (*downloadNodes
 	return &d, nil
 }
 
-func (s *Scheduler) GetUploadNodes(region, bucket, key string, size int64) (*UploadNodesResponse, error) {
+func (s *Scheduler) GetUploadNodes(uploadId, objectId, fileHash string, size int64) (*UploadNodesResponse, error) {
 	query := url.Values{}
-	query.Add("region", region)
-	query.Add("bucket", bucket)
-	query.Add("key", key)
+	query.Add("uploadId", uploadId)
+	query.Add("objectId", objectId)
+	query.Add("fileHash", fileHash)
 	query.Add("size", strconv.FormatInt(size, 10))
 	u := s.baseUrl + "/v1/upload-nodes?" + query.Encode()
 	resp, err := s.cli.Get(u)
@@ -118,8 +116,6 @@ func (s *Scheduler) CommitObject(ctx context.Context, req CommitObjectReq) error
 		return fmt.Errorf("new request error:%w", err)
 	}
 	r.Header.Set("Content-Type", "application/json")
-	rb, _ := httputil.DumpRequest(r, true)
-	log.Printf("commit object:%s", rb)
 	resp, err := s.cli.Do(r)
 	if err != nil {
 		return fmt.Errorf("scheduler request error:%s", err)
@@ -147,14 +143,10 @@ func (s *Scheduler) PreCheck(ctx context.Context, req PreCheckReq) (match bool, 
 		return false, err
 	}
 	r.Header.Set("Content-Type", "application/json")
-	rb, _ := httputil.DumpRequest(r, true)
-	log.Printf("precheck request:%s", rb)
 	resp, err := s.cli.Do(r)
 	if err != nil {
 		return false, err
 	}
-	b, _ := httputil.DumpResponse(resp, true)
-	log.Printf("precheck response:%s", b)
 	defer resp.Body.Close()
 
 	d, err := parseBody[PreCheckHashResponse](resp.Body)
