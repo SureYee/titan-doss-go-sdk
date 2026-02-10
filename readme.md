@@ -1,38 +1,48 @@
 
+
+## 上传流程图
+
 ```mermaid
-sequenceDiagram
-    participant C as 客户端 (Client)
-    participant S as 服务端 (Server)
-    participant DB as 数据库/对象存储
-
-    Note over C: 用户选择文件 (例如: 1GB 视频)
-
-    rect rgb(240, 248, 255)
-    Note right of C: 阶段 1: 预检 (快速过滤)
-    C->>C: 获取文件大小 (Size)<br/>计算前 256KB 的哈希 (Stub Hash)
-    C->>S: 发送 {Size, Stub Hash} 进行预检
-    S->>DB: 查询是否存在该 Size 和 Stub Hash
-    DB-->>S: 返回查询结果
-    end
-
-    alt 数据库中完全没见过该特征
-        S-->>C: 结果：不匹配 (必须上传)
-        C->>C: 进入常规分块上传流程...
-    else 存在特征匹配 (可能可以秒传)
-        rect rgb(255, 245, 238)
-        Note right of C: 阶段 2: 深度验证 (防止误判)
-        S-->>C: 要求发送全量 Merkle Root
-        C->>C: 分块计算所有 Chunk Hash<br/>构建 Merkle Tree 并得到 Root Hash
-        C->>S: 发送全量 Root Hash
-        S->>DB: 匹配 Root Hash 是否存在
-        end
-
-        alt Root Hash 匹配成功
-            S->>DB: 在用户文件表新增记录<br/>(指向已有的物理文件 ID)
-            S-->>C: 响应：秒传成功！
-        else Root Hash 匹配失败 (仅前端特征巧合)
-            S-->>C: 结果：不匹配 (必须上传)
-            C->>C: 进入常规分块上传流程...
-        end
-    end
+flowchart TD
+    Start(["开始 UploadFile"]) --> PreCheckCalc["计算前 256KB 的 SHA256"]
+    PreCheckCalc --> PreCheckReq["调用 scheduler.PreCheck"]
+    PreCheckReq --> PreCheckMatch{"预检是否匹配?"}
+    
+    PreCheckMatch -- "是" --> BuildMerkle["构建文件 Merkle Tree"]
+    PreCheckMatch -- "否" --> BuildMerkle
+    
+    BuildMerkle --> HashCheckReq["调用 scheduler.HashCheck (带 Merkle Root)"]
+    HashCheckReq --> HashCheckMatch{"Hash 检测是否匹配?"}
+    
+    HashCheckMatch -- "是" --> Success(["上传成功 (秒传)"])
+    HashCheckMatch -- "否" --> GetNodes["调用 scheduler.GetUploadNodes"]
+    
+    GetNodes --> CheckEC{"优先判断: EnableErasure?"}
+    
+    %% Erasure Coding Path (Priority 1)
+    CheckEC -- "是" --> ECEncoding["纠删码编码: 切分数据 + 校验片"]
+    ECEncoding --> UploadShards["并发上传分片到节点"]
+    UploadShards --> CheckSuccess{"成功分片数足够?"}
+    CheckSuccess -- "是" --> UnifiedCommit
+    CheckSuccess -- "否" --> Fail["上传失败"]
+    
+    %% Multipart / Simple Path
+    CheckEC -- "否" --> CheckMultipart{"其次判断: EnableMultipart?"}
+    
+    %% Multipart Upload Path (Priority 2)
+    CheckMultipart -- "是" --> MultipartUpload["开始 S3 分片上传 (Multipart)"]
+    MultipartUpload --> UploadParts["并发上传分片"]
+    UploadParts --> VerifyParts["验证分片 Hash"]
+    VerifyParts --> CalcRoot["计算分片 Merkle Root"]
+    CalcRoot --> UnifiedCommit
+    
+    %% Simple Upload Path (Priority 3)
+    CheckMultipart -- "否" --> SimpleUpload["简单上传 (单流)"]
+    SimpleUpload --> SimpleUploadExec["上传完整文件到单节点"]
+    SimpleUploadExec --> UnifiedCommit
+    
+    %% Unified Commit
+    UnifiedCommit["统一提交: 调用 scheduler.CommitObject"] --> CommitSuccess{"提交是否成功?"}
+    CommitSuccess -- "是" --> Success
+    CommitSuccess -- "否" --> Fail(["上传失败"])
 ```

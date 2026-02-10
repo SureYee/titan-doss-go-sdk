@@ -2,7 +2,7 @@ package manager
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/md5"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -91,7 +91,7 @@ func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedH
 				contentLength = filesize - offset
 			}
 			sectionReader := io.NewSectionReader(r, offset, partSize)
-			hasher := sha256.New()
+			hasher := md5.New()
 			r := io.TeeReader(sectionReader, hasher)
 			resp, err := u.UploadFile(ctx, presignPart, r, contentLength)
 			if err != nil {
@@ -104,7 +104,7 @@ func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedH
 				PartNumber: partNumber,
 				Etag:       resp.Header.Get("Etag"),
 				Hash:       hash,
-				HashType:   "sha256",
+				HashType:   "md5",
 				Size:       contentLength,
 			}
 			return nil
