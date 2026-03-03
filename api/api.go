@@ -64,12 +64,24 @@ func NewApi(baseUrl string) *ApiClient {
 	}
 }
 
-func (s *ApiClient) GetDownloadNodes(ctx context.Context, region, bucket, key string) (*downloadNodesResponse, error) {
+type Option struct {
+	token string
+}
+
+type OptionFunc func(*Option)
+
+func WithToken(token string) OptionFunc {
+	return func(o *Option) {
+		o.token = token
+	}
+}
+
+func (s *ApiClient) GetDownloadNodes(ctx context.Context, region, bucket, key string, opts ...OptionFunc) (*downloadNodesResponse, error) {
 	req, err := s.buildRequest(ctx, http.MethodGet, V1_DownloadNodes, map[string]string{
 		"region": region,
 		"bucket": bucket,
 		"key":    key,
-	}, nil)
+	}, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -86,10 +98,10 @@ func (s *ApiClient) GetDownloadNodes(ctx context.Context, region, bucket, key st
 	return &d, nil
 }
 
-func (s *ApiClient) GetUploadNodes(ctx context.Context, sessionId string) (*UploadNodesResponse, error) {
+func (s *ApiClient) GetUploadNodes(ctx context.Context, sessionId string, opts ...OptionFunc) (*UploadNodesResponse, error) {
 	req, err := s.buildRequest(ctx, http.MethodGet, V1_GetUploadNodes, map[string]string{
 		"sessionId": sessionId,
-	}, nil)
+	}, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,8 +119,8 @@ func (s *ApiClient) GetUploadNodes(ctx context.Context, sessionId string) (*Uplo
 	return &d, nil
 }
 
-func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq) error {
-	r, err := s.buildRequest(ctx, http.MethodPost, V1_CommitObject, nil, req)
+func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq, opts ...OptionFunc) error {
+	r, err := s.buildRequest(ctx, http.MethodPost, V1_CommitObject, nil, req, opts...)
 	if err != nil {
 		return err
 	}
@@ -127,7 +139,7 @@ func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq) error
 
 // PreCheck
 // 预检
-func (s *ApiClient) PreCheck(ctx context.Context, req PreCheckReq) (match bool, err error) {
+func (s *ApiClient) PreCheck(ctx context.Context, req PreCheckReq, opts ...OptionFunc) (match bool, err error) {
 	//
 	buf := bytes.NewBuffer(nil)
 	if err := json.NewEncoder(buf).Encode(req); err != nil {
@@ -152,8 +164,8 @@ func (s *ApiClient) PreCheck(ctx context.Context, req PreCheckReq) (match bool, 
 	return d.Match, nil
 }
 
-func (s *ApiClient) HashCheck(ctx context.Context, req HashCheckReq) (object any, match bool, err error) {
-	r, err := s.buildRequest(ctx, http.MethodPost, V1_HashCheck, nil, req)
+func (s *ApiClient) HashCheck(ctx context.Context, req HashCheckReq, opts ...OptionFunc) (object any, match bool, err error) {
+	r, err := s.buildRequest(ctx, http.MethodPost, V1_HashCheck, nil, req, opts...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -170,7 +182,12 @@ func (s *ApiClient) HashCheck(ctx context.Context, req HashCheckReq) (object any
 	return nil, d.Match, nil
 }
 
-func (s *ApiClient) buildRequest(ctx context.Context, method string, path string, param map[string]string, data any) (*http.Request, error) {
+func (s *ApiClient) buildRequest(ctx context.Context, method string, path string, param map[string]string, data any, opts ...OptionFunc) (*http.Request, error) {
+	var opt = new(Option)
+	for _, o := range opts {
+		o(opt)
+	}
+
 	var body io.Reader
 	if data != nil {
 		buf := bytes.NewBuffer(nil)
@@ -195,7 +212,13 @@ func (s *ApiClient) buildRequest(ctx context.Context, method string, path string
 	}
 
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+s.genToken())
+	var token string
+	if opt.token != "" {
+		token = opt.token
+	} else {
+		token = s.genToken()
+	}
+	r.Header.Set("Authorization", "Bearer "+token)
 	return r, nil
 }
 
@@ -203,8 +226,8 @@ func (s *ApiClient) genToken() string {
 	return "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzA3NzY1OTksImlhdCI6MTc3MDYwMzc5OSwidXVpZCI6ImQ1c3U4aXZnNW82bGVjcjhic2cwIn0.EHtLqPn0iimeGHyo-kwMMh9ziPA-DPdzQhWKJSmVLvg"
 }
 
-func (s *ApiClient) CreateUpload(ctx context.Context, req *CreateUploadReq) (*CreateUploadResp, error) {
-	r, err := s.buildRequest(ctx, http.MethodPost, "/v1/create-upload", nil, req)
+func (s *ApiClient) CreateUpload(ctx context.Context, req *CreateUploadReq, opts ...OptionFunc) (*CreateUploadResp, error) {
+	r, err := s.buildRequest(ctx, http.MethodPost, "/v1/create-upload", nil, req, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +246,7 @@ func parseBody[T any](body io.Reader) (t T, err error) {
 		return t, err
 	}
 	if resp.Code != CodeSuccess {
-		return t, fmt.Errorf("[%d] %s", resp.Code, resp.Msg)
+		return t, NewResponseError(resp.Code, resp.Msg)
 	}
 	return resp.Data, nil
 }

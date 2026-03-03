@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
-	"os"
 	"sync"
 
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -75,7 +75,7 @@ func upload(u *Uploader, ctx context.Context, req *http.Request) (*Response, err
 
 // UploadPart
 // 上传分片数据
-func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedHTTPRequest, r *os.File, filesize, partSize int64) ([]*PartResponse, error) {
+func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedHTTPRequest, r multipart.File, filesize, partSize int64) ([]*PartResponse, error) {
 	g, ctx := errgroup.WithContext(ctx)
 	responses := make([]*PartResponse, len(presignParts))
 	lock := &sync.Mutex{}

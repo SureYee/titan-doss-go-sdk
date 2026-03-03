@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,9 +21,9 @@ import (
 	"github.com/cbergoon/merkletree"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/klauspost/reedsolomon"
-	"github.com/titan/doss-go-sdk/internal/api"
-	"github.com/titan/doss-go-sdk/internal/erasure"
-	"github.com/titan/doss-go-sdk/internal/manager"
+	"github.com/sureyee/titan-doss-go-sdk/api"
+	"github.com/sureyee/titan-doss-go-sdk/internal/erasure"
+	"github.com/sureyee/titan-doss-go-sdk/internal/manager"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -58,35 +59,53 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) getS3Client(endpoint string, optFns ...func(*s3.Options)) *s3.Client {
-	cli := s3.NewFromConfig(aws.Config{
-		Region:       c.region,
-		BaseEndpoint: &endpoint,
-	}, optFns...)
-	return cli
-}
+type OptionFunc api.OptionFunc
 
-type result struct {
-	idx    int
-	reader io.ReadCloser
-	err    error
-}
-
-func (c *Client) createUpload(ctx context.Context, folderId int64, filename, hash string, size uint64) (string, error) {
+func (c *Client) createUpload(ctx context.Context, folderId int64, filename, hash string, size uint64, opts ...api.OptionFunc) (string, error) {
 	resp, err := c.api.CreateUpload(ctx, &api.CreateUploadReq{
 		Folder:      folderId,
 		Filename:    filename,
 		ContentType: "",
 		Hash:        hash,
 		Size:        size,
-	})
+	}, opts...)
 	if err != nil {
 		return "", err
 	}
 	return resp.SessionID, nil
 }
 
-func (c *Client) UploadFile(ctx context.Context, folderId int64, filename string) (any, error) {
+func (c *Client) UploadFile(ctx context.Context, folderId int64, file multipart.File, filename string, filesize int64, opts ...api.OptionFunc) (any, error) {
+	log.Print("开始进行hash计算")
+	st := time.Now()
+	// 优化：同时计算 Merkle Tree 和文件 Hash，避免重复读取
+	tree, fileHash, err := c.buildMerkleTreeWithHash(file, 5*1024*1024)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("构建 Merkle Tree 和计算文件 Hash 完成，耗时: %s, hash:%s", time.Since(st), fileHash)
+	sessionId, err := c.createUpload(ctx, folderId, filepath.Base(filename), fileHash, uint64(filesize), opts...)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("创建上传会话成功，sessionId: %s", sessionId)
+	obj, matched, err := c.hashCheck(ctx, sessionId, tree, opts...)
+	if err != nil {
+		log.Printf("Hash检测错误：%s", err)
+		return nil, err
+	}
+	if matched {
+		log.Printf("Hash检测匹配成功")
+		return obj, nil
+	}
+	// 开始上传文件
+	log.Println("开始上传文件...")
+	_, err = c.upload(ctx, sessionId, file, fileHash, filesize, opts...)
+
+	return nil, err
+}
+
+func (c *Client) Upload(ctx context.Context, folderId int64, filename string) (any, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -98,33 +117,7 @@ func (c *Client) UploadFile(ctx context.Context, folderId int64, filename string
 	}
 
 	filesize := stat.Size()
-	log.Print("开始进行hash计算")
-	st := time.Now()
-	// 优化：同时计算 Merkle Tree 和文件 Hash，避免重复读取
-	tree, fileHash, err := c.buildMerkleTreeWithHash(file, 5*1024*1024)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("构建 Merkle Tree 和计算文件 Hash 完成，耗时: %s, hash:%s", time.Since(st), fileHash)
-	sessionId, err := c.createUpload(ctx, folderId, filepath.Base(filename), fileHash, uint64(filesize))
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("创建上传会话成功，sessionId: %s", sessionId)
-	obj, matched, err := c.hashCheck(ctx, sessionId, tree)
-	if err != nil {
-		log.Printf("Hash检测错误：%s", err)
-		return nil, err
-	}
-	if matched {
-		log.Printf("Hash检测匹配成功")
-		return obj, nil
-	}
-	// 开始上传文件
-	log.Println("开始上传文件...")
-	_, err = c.upload(ctx, sessionId, file, fileHash, filesize)
-
-	return nil, err
+	return c.UploadFile(ctx, folderId, file, filename, filesize)
 }
 
 // hashContent is a wrapper for a byte slice that satisfies the merkletree.Content interface.
@@ -150,11 +143,11 @@ func (c hashContent) Equals(other merkletree.Content) (bool, error) {
 	return bytes.Equal(c.content, otherC.content), nil
 }
 
-func (c *Client) upload(ctx context.Context, sessionId string, file *os.File, filehash string, filesize int64) (any, error) {
+func (c *Client) upload(ctx context.Context, sessionId string, file multipart.File, filehash string, filesize int64, opts ...api.OptionFunc) (any, error) {
 	// 获取节点列表
 
 	// filehash 已经在外部计算并传入
-	resp, err := c.api.GetUploadNodes(ctx, sessionId)
+	resp, err := c.api.GetUploadNodes(ctx, sessionId, opts...)
 	if err != nil {
 		log.Printf("获取上传节点列表失败:%s", err)
 		return nil, err
@@ -214,7 +207,7 @@ func (c *Client) upload(ctx context.Context, sessionId string, file *os.File, fi
 	}, nil
 }
 
-func (c *Client) buildMerkleTreeWithHash(file *os.File, size int64) (*merkletree.MerkleTree, string, error) {
+func (c *Client) buildMerkleTreeWithHash(file multipart.File, size int64) (*merkletree.MerkleTree, string, error) {
 	defer file.Seek(0, io.SeekStart)
 	chunk := make([]byte, size)
 	var (
@@ -253,7 +246,7 @@ func (c *Client) buildMerkleTreeWithHash(file *os.File, size int64) (*merkletree
 	return tree, fileHash, nil
 }
 
-func (c *Client) hashCheck(ctx context.Context, sessionId string, merkletree *merkletree.MerkleTree) (obj any, match bool, err error) {
+func (c *Client) hashCheck(ctx context.Context, sessionId string, merkletree *merkletree.MerkleTree, opts ...api.OptionFunc) (obj any, match bool, err error) {
 	var (
 		leafHashs []api.LeafHash
 	)
@@ -273,12 +266,12 @@ func (c *Client) hashCheck(ctx context.Context, sessionId string, merkletree *me
 		RootHash:  rootHash,
 		LeafHash:  leafHashs,
 		SessionID: sessionId,
-	})
+	}, opts...)
 	// 调用调度器进行深度验证
 	return obj, match, err
 }
 
-func (c *Client) uploadMultiNode(ctx context.Context, file *os.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
+func (c *Client) uploadMultiNode(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
 	chunkSize := conf.MultinodeChunkSize
 	if chunkSize == 0 {
 		chunkSize = defaultBlockSize
@@ -371,7 +364,7 @@ func (c *Client) uploadMultiNode(ctx context.Context, file *os.File, filesize in
 	return shards, nil
 }
 
-func (c *Client) uploadErasure(ctx context.Context, file *os.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
+func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
 	log.Println("检测到开启纠删码上传...")
 	var shardNumber int64 = int64(conf.DataShard + conf.ParityShard)
 	if len(nodes) < int(shardNumber) {
@@ -488,7 +481,7 @@ func (c *Client) uploadErasure(ctx context.Context, file *os.File, filesize int6
 	return shards, nil
 }
 
-func (c *Client) uploadMultipart(ctx context.Context, file *os.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, apiResp *api.UploadNodesResponse) ([]api.Shard, error) {
+func (c *Client) uploadMultipart(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, apiResp *api.UploadNodesResponse) ([]api.Shard, error) {
 	log.Println("检测到开启 Multipart 分片上传...")
 	uploader := manager.NewUploader()
 	presignParts := make([]*v4.PresignedHTTPRequest, 0, len(nodes))
@@ -534,7 +527,7 @@ func (c *Client) uploadMultipart(ctx context.Context, file *os.File, filesize in
 	return shards, nil
 }
 
-func (c *Client) uploadSimple(ctx context.Context, file *os.File, filesize int64, filehash string, nodes []api.PresignedItem) ([]api.Shard, error) {
+func (c *Client) uploadSimple(ctx context.Context, file multipart.File, filesize int64, filehash string, nodes []api.PresignedItem) ([]api.Shard, error) {
 	log.Println("执行简单单流上传...")
 	// 简单上传通常只有一个节点
 	if len(nodes) == 0 {

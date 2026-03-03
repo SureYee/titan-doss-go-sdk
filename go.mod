@@ -1,4 +1,4 @@
-module github.com/titan/doss-go-sdk
+module github.com/sureyee/titan-doss-go-sdk
 
 go 1.24.0
 
