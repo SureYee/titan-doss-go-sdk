@@ -194,7 +194,7 @@ func (c *Client) upload(ctx context.Context, sessionId string, file multipart.Fi
 	err = c.api.CommitObject(ctx, api.CommitObjectReq{
 		SessionID: sessionId,
 		ShardList: shards,
-	})
+	}, opts...)
 
 	if err != nil {
 		log.Printf("CommitObject 错误: %v", err)
