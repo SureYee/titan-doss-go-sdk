@@ -120,7 +120,7 @@ func (c *Client) Upload(ctx context.Context, folderId int64, filename string) (a
 	return c.UploadFile(ctx, folderId, file, filename, filesize)
 }
 
-func (c *Client) DownloadFile(ctx context.Context, objectId string, w io.Writer) error {
+func (c *Client) DownloadFile(ctx context.Context, objectId int64, w io.Writer) error {
 	resp, err := c.api.GetDownloadNodes(ctx, objectId)
 	if err != nil {
 		return err

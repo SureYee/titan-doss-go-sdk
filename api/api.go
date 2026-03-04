@@ -86,9 +86,9 @@ func WithToken(token string) OptionFunc {
 	}
 }
 
-func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId string, opts ...OptionFunc) (*downloadNodesResponse, error) {
+func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId int64, opts ...OptionFunc) (*downloadNodesResponse, error) {
 	req, err := s.buildRequest(ctx, http.MethodGet, V1_DownloadNodes, map[string]string{
-		"fileId": fileId,
+		"fileId": fmt.Sprint(fileId),
 	}, nil, opts...)
 	if err != nil {
 		return nil, err
