@@ -38,16 +38,26 @@ type Shard struct {
 	Etag     string `json:"etag"`
 }
 
-type object struct {
+type Fileinfo struct {
 	Size     int64  `json:"size"`
 	Hash     string `json:"hash"`
 	HashType string `json:"hashType"`
 }
 
+type DownloadConfig struct {
+	EnableMultiNode    bool  `json:"enableMultiNode"`    // 是否开启多节点存储
+	EnableErasure      bool  `json:"enableErasure"`      // 多节点存储时，是否启用纠删码
+	EnableMultipart    bool  `json:"enableMultipart"`    // 是否开启分片上传
+	MultinodeChunkSize int64 `json:"multinodeChunkSize"` // 分节点存储时，每个节点存储数据的大小
+	DataShard          int64 `json:"dataShard"`          // 数据分片数量
+	ParityShard        int64 `json:"parityShard"`        // 校验分片数量
+	MultipartChunkSize int64 `json:"multipartChunkSize"` // 分片大小
+}
+
 type downloadNodesResponse struct {
-	Object object  `json:"fileinfo"`
-	Shards []Shard `json:"shards"`
-	// Config  `json:"config"`
+	Fileinfo Fileinfo        `json:"fileinfo"`
+	Shards   []PresignedItem `json:"shards"`
+	Config   DownloadConfig  `json:"config"`
 }
 
 type ApiClient struct {
@@ -76,11 +86,9 @@ func WithToken(token string) OptionFunc {
 	}
 }
 
-func (s *ApiClient) GetDownloadNodes(ctx context.Context, region, bucket, key string, opts ...OptionFunc) (*downloadNodesResponse, error) {
+func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId string, opts ...OptionFunc) (*downloadNodesResponse, error) {
 	req, err := s.buildRequest(ctx, http.MethodGet, V1_DownloadNodes, map[string]string{
-		"region": region,
-		"bucket": bucket,
-		"key":    key,
+		"fileId": fileId,
 	}, nil, opts...)
 	if err != nil {
 		return nil, err

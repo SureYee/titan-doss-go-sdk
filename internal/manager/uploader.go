@@ -39,7 +39,7 @@ func NewUploader() *Uploader {
 	}
 }
 
-func upload(u *Uploader, ctx context.Context, req *http.Request) (*Response, error) {
+func upload(u *Uploader, req *http.Request) (*Response, error) {
 	log.Printf("endpoint:%s", req.URL.String())
 	// 使用 Uploader 内嵌的 http.Client 发送请求
 	// u.Client 是一个标准的 Go HTTP 客户端
@@ -126,5 +126,5 @@ func (u *Uploader) UploadFile(ctx context.Context, presignResult *v4.PresignedHT
 	// 这部分头部信息包含了认证和授权所需的重要字段，如 "X-Amz-..." 等
 	req.Header = presignResult.SignedHeader
 	req.ContentLength = contentLength
-	return upload(u, ctx, req)
+	return upload(u, req)
 }

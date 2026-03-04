@@ -120,6 +120,88 @@ func (c *Client) Upload(ctx context.Context, folderId int64, filename string) (a
 	return c.UploadFile(ctx, folderId, file, filename, filesize)
 }
 
+func (c *Client) DownloadFile(ctx context.Context, objectId string, w io.Writer) error {
+	resp, err := c.api.GetDownloadNodes(ctx, objectId)
+	if err != nil {
+		return err
+	}
+	if len(resp.Shards) == 0 {
+		return errors.New("没有可用的下载节点")
+	}
+	config := resp.Config
+	if config.EnableMultiNode {
+		if config.EnableErasure {
+			log.Println("检测到开启纠删码下载...")
+			return c.downloadErasure(ctx, w, resp.Shards, config)
+		} else {
+			log.Println("检测到开启多节点下载...")
+			return c.downloadMultiNode(ctx, w, resp.Shards, config)
+		}
+	}
+	r, err := c.downloadSimple(ctx, resp.Shards[0])
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, r)
+	return err
+}
+
+func (c *Client) downloadMultiNode(ctx context.Context, w io.Writer, nodes []api.PresignedItem, conf api.DownloadConfig) error {
+	// 多节点下载逻辑
+	log.Println("执行多节点下载...")
+	for _, node := range nodes {
+		log.Printf("下载节点: %s, URL: %s", node.ID, node.Presigned.Url)
+		r, err := c.downloadSimple(ctx, node)
+		if err != nil {
+			log.Printf("下载节点 %s 失败: %v", node.ID, err)
+			return err
+		}
+		_, err = io.Copy(w, r)
+		if err != nil {
+			log.Printf("从节点 %s 复制数据失败: %v", node.ID, err)
+			return err
+		}
+		log.Printf("节点 %s 下载完成", node.ID)
+	}
+	return nil
+}
+
+func (c *Client) downloadErasure(ctx context.Context, w io.Writer, nodes []api.PresignedItem, conf api.DownloadConfig) error {
+	// 纠删码下载逻辑
+	log.Println("执行纠删码下载...")
+	er, err := erasure.NewErasure(ctx, int(conf.DataShard), int(conf.ParityShard), defaultBlockSize)
+	if err != nil {
+		log.Printf("创建 Erasure 实例失败: %v", err)
+		return err
+	}
+	readers := make([]io.Reader, conf.DataShard+conf.ParityShard)
+	wg := sync.WaitGroup{}
+	for i, node := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := c.downloadSimple(ctx, node)
+			if err != nil {
+				log.Printf("下载节点 %s 失败: %v", node.ID, err)
+				return
+			}
+			readers[i] = r
+		}()
+	}
+	wg.Wait()
+	return er.Decode(ctx, w, readers)
+}
+
+func (c *Client) downloadSimple(ctx context.Context, node api.PresignedItem) (io.Reader, error) {
+	downloader := manager.NewDonwloader()
+	req := &v4.PresignedHTTPRequest{
+		URL:          node.Presigned.Url,
+		Method:       node.Presigned.Method,
+		SignedHeader: node.Presigned.Headers,
+	}
+	return downloader.Download(ctx, req)
+}
+
 // hashContent is a wrapper for a byte slice that satisfies the merkletree.Content interface.
 type hashContent struct {
 	content []byte
