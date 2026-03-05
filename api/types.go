@@ -19,7 +19,7 @@ type CreateUploadResp struct {
 }
 
 type UploadConfig struct {
-	EnableMultiNode    bool  `json:"enable"`
+	EnableMultiNode    bool  `json:"enableMultiNode"`
 	EnableErasure      bool  `json:"enableErasure"`
 	EnableMultipart    bool  `json:"enableMultipart"`
 	MultinodeChunkSize int64 `json:"multinodeChunkSize"`
