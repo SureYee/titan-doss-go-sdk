@@ -9,6 +9,8 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/klauspost/reedsolomon v1.12.6
 	golang.org/x/sync v0.19.0
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
+
 )
 
 require (

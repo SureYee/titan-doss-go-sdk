@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
@@ -178,8 +180,11 @@ func (s *ApiClient) genToken() string {
 	if s.accessKey == "" || s.secretKey == "" {
 		return ""
 	}
-	// jwt
-	return ""
+	token, _ := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"accessKey": s.accessKey,
+		"exp":       time.Now().Add(15 * time.Minute).Unix(),
+	}).SignedString([]byte(s.secretKey))
+	return token
 }
 
 func (s *ApiClient) CreateUpload(ctx context.Context, req *CreateUploadReq, opts ...OptionFunc) (*CreateUploadResp, error) {
