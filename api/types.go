@@ -28,8 +28,12 @@ type UploadConfig struct {
 	MultipartChunkSize int64 `json:"multipartChunkSize"`
 }
 type PresignedItem struct {
-	ID        string    `json:"id"`
-	Presigned Presigned `json:"presigned"`
+	ID         string    `json:"id"`
+	Index      int       `json:"index"`
+	Size       int64     `json:"size"`
+	RangeStart int64     `json:"rangeStart"`
+	RangeEnd   int64     `json:"rangeEnd"`
+	Presigned  Presigned `json:"presigned"`
 }
 
 type Presigned struct {
@@ -40,7 +44,6 @@ type Presigned struct {
 
 type UploadNodesResponse struct {
 	UploadId string          `json:"uploadId"`
-	ObjectId string          `json:"objectId"`
 	List     []PresignedItem `json:"list"`
 	Config   UploadConfig    `json:"config"`
 }
@@ -48,15 +51,6 @@ type UploadNodesResponse struct {
 type CommitObjectReq struct {
 	SessionID string  `json:"sessionId"` // 文件上传sessionKey
 	ShardList []Shard `json:"shardList"`
-}
-
-type PreCheckReq struct {
-	SessionID string `json:"sessionId"` // 文件上传sessionKey
-	PreHash   string `json:"preHash"`   // 文件预检hash
-}
-
-type PreCheckHashResponse struct {
-	Match bool `json:"match"`
 }
 
 type LeafHash struct {
@@ -70,9 +64,39 @@ type HashCheckReq struct {
 	LeafHash  []LeafHash `json:"leafHash"`
 }
 
-type Part struct{}
+type Shard struct {
+	Index    int    `json:"index"`
+	Status   int    `json:"status"`
+	Size     uint64 `json:"size"`
+	Hash     string `json:"hash"`
+	HashType string `json:"hashType"`
+	NodeID   string `json:"nodeID"`
+	Message  string `json:"message"`
+	Etag     string `json:"etag"`
+}
 
-type PresignMultipartResponse struct {
-	ObjectID string `json:"objectId"`
-	Parts    []Part `json:"parts"`
+type Fileinfo struct {
+	Size     int64  `json:"size"`
+	Hash     string `json:"hash"`
+	HashType string `json:"hashType"`
+}
+
+type DownloadConfig struct {
+	EnableMultiNode    bool  `json:"enableMultiNode"`    // 是否开启多节点存储
+	EnableErasure      bool  `json:"enableErasure"`      // 多节点存储时，是否启用纠删码
+	EnableMultipart    bool  `json:"enableMultipart"`    // 是否开启分片上传
+	MultinodeChunkSize int64 `json:"multinodeChunkSize"` // 分节点存储时，每个节点存储数据的大小
+	DataShard          int64 `json:"dataShard"`          // 数据分片数量
+	ParityShard        int64 `json:"parityShard"`        // 校验分片数量
+	MultipartChunkSize int64 `json:"multipartChunkSize"` // 分片大小
+}
+
+type DownloadNodesResponse struct {
+	Fileinfo Fileinfo        `json:"fileinfo"`
+	Shards   []PresignedItem `json:"shards"`
+	Config   DownloadConfig  `json:"config"`
+}
+
+type HashCheckResponse struct {
+	Match bool `json:"match"`
 }

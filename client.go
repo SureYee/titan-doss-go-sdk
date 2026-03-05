@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/cbergoon/merkletree"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/klauspost/reedsolomon"
 	"github.com/sureyee/titan-doss-go-sdk/api"
 	"github.com/sureyee/titan-doss-go-sdk/internal/erasure"
 	"github.com/sureyee/titan-doss-go-sdk/internal/manager"
@@ -32,15 +31,14 @@ var (
 )
 
 type Client struct {
-	encoder reedsolomon.Encoder
-	region  string
-	api     *api.ApiClient
-	cfg     Config
+	api *api.ApiClient
+	cfg Config
 }
 
 type Config struct {
 	BaseEndpoint        string
-	Region              string
+	AccessKey           string
+	SecretKey           string
 	MaxRetryElapsedTime time.Duration
 }
 
@@ -51,11 +49,10 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.MaxRetryElapsedTime == 0 {
 		cfg.MaxRetryElapsedTime = time.Second
 	}
-	api := api.NewApi(cfg.BaseEndpoint)
+	api := api.NewApi(cfg.BaseEndpoint, cfg.AccessKey, cfg.SecretKey)
 	return &Client{
-		region: cfg.Region,
-		api:    api,
-		cfg:    cfg,
+		api: api,
+		cfg: cfg,
 	}, nil
 }
 
@@ -105,7 +102,7 @@ func (c *Client) UploadFile(ctx context.Context, folderId int64, file multipart.
 	return nil, err
 }
 
-func (c *Client) Upload(ctx context.Context, folderId int64, filename string) (any, error) {
+func (c *Client) Upload(ctx context.Context, folderId int64, filename string, opts ...api.OptionFunc) (any, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -117,11 +114,11 @@ func (c *Client) Upload(ctx context.Context, folderId int64, filename string) (a
 	}
 
 	filesize := stat.Size()
-	return c.UploadFile(ctx, folderId, file, filename, filesize)
+	return c.UploadFile(ctx, folderId, file, filename, filesize, opts...)
 }
 
-func (c *Client) DownloadFile(ctx context.Context, objectId int64, w io.Writer) error {
-	resp, err := c.api.GetDownloadNodes(ctx, objectId)
+func (c *Client) DownloadFile(ctx context.Context, objectId int64, w io.Writer, opts ...api.OptionFunc) error {
+	resp, err := c.api.GetDownloadNodes(ctx, objectId, opts...)
 	if err != nil {
 		return err
 	}

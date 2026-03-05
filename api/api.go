@@ -27,47 +27,18 @@ const (
 	V1_CommitObject   = "/v1/commit-object"
 )
 
-type Shard struct {
-	Index    int    `json:"index"`
-	Status   int    `json:"status"`
-	Size     uint64 `json:"size"`
-	Hash     string `json:"hash"`
-	HashType string `json:"hashType"`
-	NodeID   string `json:"nodeID"`
-	Message  string `json:"message"`
-	Etag     string `json:"etag"`
-}
-
-type Fileinfo struct {
-	Size     int64  `json:"size"`
-	Hash     string `json:"hash"`
-	HashType string `json:"hashType"`
-}
-
-type DownloadConfig struct {
-	EnableMultiNode    bool  `json:"enableMultiNode"`    // 是否开启多节点存储
-	EnableErasure      bool  `json:"enableErasure"`      // 多节点存储时，是否启用纠删码
-	EnableMultipart    bool  `json:"enableMultipart"`    // 是否开启分片上传
-	MultinodeChunkSize int64 `json:"multinodeChunkSize"` // 分节点存储时，每个节点存储数据的大小
-	DataShard          int64 `json:"dataShard"`          // 数据分片数量
-	ParityShard        int64 `json:"parityShard"`        // 校验分片数量
-	MultipartChunkSize int64 `json:"multipartChunkSize"` // 分片大小
-}
-
-type downloadNodesResponse struct {
-	Fileinfo Fileinfo        `json:"fileinfo"`
-	Shards   []PresignedItem `json:"shards"`
-	Config   DownloadConfig  `json:"config"`
-}
-
 type ApiClient struct {
-	baseUrl string
-	cli     http.Client
+	baseUrl   string
+	accessKey string
+	secretKey string
+	cli       http.Client
 }
 
-func NewApi(baseUrl string) *ApiClient {
+func NewApi(baseUrl string, accessKey, secretKey string) *ApiClient {
 	return &ApiClient{
-		baseUrl: baseUrl,
+		baseUrl:   baseUrl,
+		accessKey: accessKey,
+		secretKey: secretKey,
 		cli: http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -86,7 +57,7 @@ func WithToken(token string) OptionFunc {
 	}
 }
 
-func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId int64, opts ...OptionFunc) (*downloadNodesResponse, error) {
+func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId int64, opts ...OptionFunc) (*DownloadNodesResponse, error) {
 	req, err := s.buildRequest(ctx, http.MethodGet, V1_DownloadNodes, map[string]string{
 		"fileId": fmt.Sprint(fileId),
 	}, nil, opts...)
@@ -99,7 +70,7 @@ func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId int64, opts ...
 	}
 	defer resp.Body.Close()
 
-	d, err := parseBody[downloadNodesResponse](resp.Body)
+	d, err := parseBody[DownloadNodesResponse](resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -145,33 +116,6 @@ func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq, opts 
 
 }
 
-// PreCheck
-// 预检
-func (s *ApiClient) PreCheck(ctx context.Context, req PreCheckReq, opts ...OptionFunc) (match bool, err error) {
-	//
-	buf := bytes.NewBuffer(nil)
-	if err := json.NewEncoder(buf).Encode(req); err != nil {
-		return false, err
-	}
-	u := s.baseUrl + "/v1/pre-check-hash"
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u, buf)
-	if err != nil {
-		return false, err
-	}
-	r.Header.Set("Content-Type", "application/json")
-	resp, err := s.cli.Do(r)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	d, err := parseBody[PreCheckHashResponse](resp.Body)
-	if err != nil {
-		return false, err
-	}
-	return d.Match, nil
-}
-
 func (s *ApiClient) HashCheck(ctx context.Context, req HashCheckReq, opts ...OptionFunc) (object any, match bool, err error) {
 	r, err := s.buildRequest(ctx, http.MethodPost, V1_HashCheck, nil, req, opts...)
 	if err != nil {
@@ -183,7 +127,7 @@ func (s *ApiClient) HashCheck(ctx context.Context, req HashCheckReq, opts ...Opt
 	}
 	defer resp.Body.Close()
 
-	d, err := parseBody[PreCheckHashResponse](resp.Body)
+	d, err := parseBody[HashCheckResponse](resp.Body)
 	if err != nil {
 		return nil, false, err
 	}
@@ -231,7 +175,11 @@ func (s *ApiClient) buildRequest(ctx context.Context, method string, path string
 }
 
 func (s *ApiClient) genToken() string {
-	return "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzA3NzY1OTksImlhdCI6MTc3MDYwMzc5OSwidXVpZCI6ImQ1c3U4aXZnNW82bGVjcjhic2cwIn0.EHtLqPn0iimeGHyo-kwMMh9ziPA-DPdzQhWKJSmVLvg"
+	if s.accessKey == "" || s.secretKey == "" {
+		return ""
+	}
+	// jwt
+	return ""
 }
 
 func (s *ApiClient) CreateUpload(ctx context.Context, req *CreateUploadReq, opts ...OptionFunc) (*CreateUploadResp, error) {
