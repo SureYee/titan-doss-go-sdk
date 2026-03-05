@@ -96,7 +96,7 @@ func (e *Erasure) ShardSize() int64 {
 func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer) (int64, error) {
 	// encoder
 	var total int64
-	buf := make([]byte, e.blockSize)
+	buf := make([]byte, e.blockSize*int64(e.dataBlocks))
 	writer := &multiWriter{
 		writers: writers,
 		errs:    make([]error, len(writers)),
