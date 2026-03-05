@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"os"
 	"path/filepath"
@@ -455,7 +456,8 @@ func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesiz
 	uploadNodes := nodes[:shardNumber]
 	writers := make([]io.Writer, shardNumber)
 	shards := make([]api.Shard, shardNumber)
-
+	chunkSize := int64(math.Ceil(float64(filesize) / float64(conf.DataShard)))
+	log.Printf("文件大小: %d, 分片大小: %d, 数据分片数量: %d, 校验分片数量: %d", filesize, int64(chunkSize), conf.DataShard, conf.ParityShard)
 	var failedUploads int
 	var mu sync.Mutex
 
@@ -481,14 +483,12 @@ func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesiz
 				if egCtx.Err() != nil {
 					return backoff.Permanent(egCtx.Err())
 				}
-				// 注意：此处 filesize 不是总文件大小，而是分片大小，为了简单起见，这里传入总大小可能不准确，
-				// 但原逻辑如此。正确的做法应该是传入实际分片大小，但在 pipe 模式下难以预知。
-				// 假设 uploader 内部处理流式上传。
+
 				_, err := uploader.UploadFile(egCtx, &v4.PresignedHTTPRequest{
 					URL:          node.Presigned.Url,
 					Method:       node.Presigned.Method,
 					SignedHeader: node.Presigned.Headers,
-				}, teeReader, filesize) // 这里的 filesize 传入可能需要调整，但保持原有逻辑
+				}, teeReader, chunkSize) // 这里的 filesize 传入可能需要调整，但保持原有逻辑
 				return err
 			}
 
