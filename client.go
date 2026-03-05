@@ -32,7 +32,7 @@ var (
 
 type Client struct {
 	api *api.ApiClient
-	cfg Config
+	cfg *Config
 }
 
 type Config struct {
@@ -42,7 +42,7 @@ type Config struct {
 	MaxRetryElapsedTime time.Duration
 }
 
-func NewClient(cfg Config) (*Client, error) {
+func NewClient(cfg *Config) (*Client, error) {
 	if cfg.BaseEndpoint == "" {
 		return nil, errors.New("apiURL must be set")
 	}
