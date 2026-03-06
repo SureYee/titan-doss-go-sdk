@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/klauspost/reedsolomon"
@@ -18,16 +19,6 @@ type multiWriter struct {
 var (
 	errWriterNotFound = errors.New("writer not found")
 )
-
-func countErrs(errs []error, err error) int {
-	i := 0
-	for _, err1 := range errs {
-		if err1 == err || errors.Is(err1, err) {
-			i++
-		}
-	}
-	return i
-}
 
 // Write writes data to writers.
 func (p *multiWriter) Write(ctx context.Context, blocks [][]byte) error {
@@ -82,15 +73,11 @@ func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int
 	}
 
 	// Encoder when needed.
-	e.encoder, err = reedsolomon.New(dataBlocks, parityBlocks, reedsolomon.WithAutoGoroutines(int(e.ShardSize())))
+	e.encoder, err = reedsolomon.New(dataBlocks, parityBlocks, reedsolomon.WithAutoGoroutines(e.dataBlocks+e.parityBlocks))
 	if err != nil {
 		return e, err
 	}
 	return e, err
-}
-
-func (e *Erasure) ShardSize() int64 {
-	return ceilFrac(e.blockSize, int64(e.dataBlocks))
 }
 
 func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer) (int64, error) {
@@ -152,12 +139,11 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 
 	// We read ShardSize from each reader, which corresponds to blockSize of original data
 	// (plus padding if any).
-	shardSize := int(e.ShardSize())
 	shards := make([][]byte, e.dataBlocks+e.parityBlocks)
 	readErrs := make([]error, len(readers))
 	ns := make([]int, len(readers))
 	var wg sync.WaitGroup
-
+	number := 1
 	for {
 		// Reset state for next block
 		for i := range shards {
@@ -165,7 +151,6 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 			readErrs[i] = nil
 			ns[i] = 0
 		}
-
 		// Parallel read from all readers
 		wg.Add(len(readers))
 		for i, r := range readers {
@@ -175,20 +160,29 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 					readErrs[i] = io.EOF // Treat nil reader as EOF/Failed
 					return
 				}
-				buf := make([]byte, shardSize)
+				buf := make([]byte, e.blockSize)
 				var n int
 				var err error
 				// Use ReadFull to try to get full shard.
 				// If last block is partial, ReadFull returns ErrUnexpectedEOF or EOF with n > 0.
 				n, err = io.ReadFull(r, buf)
+				log.Printf("从节点%d中读取字节数%d", i, n)
+
 				ns[i] = n
 				readErrs[i] = err
 				if n > 0 {
 					shards[i] = buf
 				}
+				if err != nil {
+					log.Printf("从节点%d中读取错误:%s", i, err.Error())
+					return
+				}
 			}(i, r)
 		}
 		wg.Wait()
+
+		log.Printf("批次%d读取完成，读取结果: %v", number, ns)
+		number++
 
 		// Determine the consensus read length
 		var targetLen int
@@ -277,21 +271,4 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 			return err
 		}
 	}
-}
-
-func ceilFrac(numerator, denominator int64) (ceil int64) {
-	if denominator == 0 {
-		// do nothing on invalid input
-		return ceil
-	}
-	// Make denominator positive
-	if denominator < 0 {
-		numerator = -numerator
-		denominator = -denominator
-	}
-	ceil = numerator / denominator
-	if numerator > 0 && numerator%denominator != 0 {
-		ceil++
-	}
-	return ceil
 }

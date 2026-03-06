@@ -174,6 +174,7 @@ func (c *Client) downloadErasure(ctx context.Context, w io.Writer, nodes []api.P
 	}
 	readers := make([]io.Reader, conf.DataShard+conf.ParityShard)
 	wg := sync.WaitGroup{}
+	
 	for i, node := range nodes {
 		wg.Add(1)
 		go func() {
@@ -183,6 +184,8 @@ func (c *Client) downloadErasure(ctx context.Context, w io.Writer, nodes []api.P
 				log.Printf("下载节点 %s 失败: %v", node.ID, err)
 				return
 			}
+			// u, _ := url.Parse(node.Presigned.Url)
+			log.Printf("节点%d地址：%s", i, node.Presigned.Url)
 			readers[i] = r
 		}()
 	}
