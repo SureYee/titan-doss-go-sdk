@@ -75,7 +75,7 @@ func upload(u *Uploader, req *http.Request) (*Response, error) {
 
 // UploadPart
 // 上传分片数据
-func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedHTTPRequest, r multipart.File, filesize, partSize int64) ([]*PartResponse, error) {
+func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedHTTPRequest, r multipart.File, filesize, partSize int64, onProgress func(int64)) ([]*PartResponse, error) {
 	g, ctx := errgroup.WithContext(ctx)
 	responses := make([]*PartResponse, len(presignParts))
 	lock := &sync.Mutex{}
@@ -92,8 +92,12 @@ func (u *Uploader) UploadPart(ctx context.Context, presignParts []*v4.PresignedH
 			}
 			sectionReader := io.NewSectionReader(r, offset, partSize)
 			hasher := md5.New()
-			r := io.TeeReader(sectionReader, hasher)
-			resp, err := u.UploadFile(ctx, presignPart, r, contentLength)
+			var readStream io.Reader = sectionReader
+			if onProgress != nil {
+				readStream = &progressTracker{r: sectionReader, onProgress: onProgress}
+			}
+			tr := io.TeeReader(readStream, hasher)
+			resp, err := u.UploadFile(ctx, presignPart, tr, contentLength)
 			if err != nil {
 				return err
 			}
@@ -127,4 +131,17 @@ func (u *Uploader) UploadFile(ctx context.Context, presignResult *v4.PresignedHT
 	req.Header = presignResult.SignedHeader
 	req.ContentLength = contentLength
 	return upload(u, req)
+}
+
+type progressTracker struct {
+	r          io.Reader
+	onProgress func(int64)
+}
+
+func (pt *progressTracker) Read(p []byte) (n int, err error) {
+	n, err = pt.r.Read(p)
+	if n > 0 && pt.onProgress != nil {
+		pt.onProgress(int64(n))
+	}
+	return n, err
 }

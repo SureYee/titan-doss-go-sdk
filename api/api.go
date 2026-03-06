@@ -48,15 +48,28 @@ func NewApi(baseUrl string, accessKey, secretKey string) *ApiClient {
 }
 
 type Option struct {
-	token string
+	token    string
+	progress ProgressFunc
 }
 
 type OptionFunc func(*Option)
+
+type ProgressFunc func(loaded, total int64)
 
 func WithToken(token string) OptionFunc {
 	return func(o *Option) {
 		o.token = token
 	}
+}
+
+func WithProgress(f ProgressFunc) OptionFunc {
+	return func(o *Option) {
+		o.progress = f
+	}
+}
+
+func (o *Option) GetProgress() ProgressFunc {
+	return o.progress
 }
 
 func (s *ApiClient) GetDownloadNodes(ctx context.Context, fileId int64, opts ...OptionFunc) (*DownloadNodesResponse, error) {

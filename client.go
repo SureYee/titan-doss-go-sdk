@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -58,6 +59,44 @@ func NewClient(cfg *Config) (*Client, error) {
 }
 
 type OptionFunc api.OptionFunc
+
+type progressWriter struct {
+	w        io.Writer
+	progress api.ProgressFunc
+	loaded   *atomic.Int64
+	total    int64
+}
+
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.w.Write(p)
+	if n > 0 && pw.progress != nil {
+		newLoaded := pw.loaded.Add(int64(n))
+		if newLoaded > pw.total {
+			newLoaded = pw.total // Cap progress at 100% just in case
+		}
+		pw.progress(newLoaded, pw.total)
+	}
+	return n, err
+}
+
+type progressReader struct {
+	r        io.Reader
+	progress api.ProgressFunc
+	loaded   *atomic.Int64
+	total    int64
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.r.Read(p)
+	if n > 0 && pr.progress != nil {
+		newLoaded := pr.loaded.Add(int64(n))
+		if newLoaded > pr.total {
+			newLoaded = pr.total // prevent overcounting on retries
+		}
+		pr.progress(newLoaded, pr.total)
+	}
+	return n, err
+}
 
 func (c *Client) createUpload(ctx context.Context, folderId int64, filename, hash string, size uint64, opts ...api.OptionFunc) (string, error) {
 	resp, err := c.api.CreateUpload(ctx, &api.CreateUploadReq{
@@ -126,6 +165,21 @@ func (c *Client) DownloadFile(ctx context.Context, objectId int64, w io.Writer, 
 	if len(resp.Shards) == 0 {
 		return errors.New("没有可用的下载节点")
 	}
+
+	opt := &api.Option{}
+	for _, f := range opts {
+		f(opt)
+	}
+
+	if opt.GetProgress() != nil {
+		w = &progressWriter{
+			w:        w,
+			progress: opt.GetProgress(),
+			loaded:   &atomic.Int64{},
+			total:    resp.Fileinfo.Size,
+		}
+	}
+
 	config := resp.Config
 	if config.EnableMultiNode {
 		if config.EnableErasure {
@@ -174,7 +228,7 @@ func (c *Client) downloadErasure(ctx context.Context, w io.Writer, nodes []api.P
 	}
 	readers := make([]io.Reader, conf.DataShard+conf.ParityShard)
 	wg := sync.WaitGroup{}
-	
+
 	for i, node := range nodes {
 		wg.Add(1)
 		go func() {
@@ -245,12 +299,19 @@ func (c *Client) upload(ctx context.Context, sessionId string, file multipart.Fi
 		shards []api.Shard
 	)
 
+	opt := &api.Option{}
+	for _, f := range opts {
+		f(opt)
+	}
+	progress := opt.GetProgress()
+	loaded := &atomic.Int64{}
+
 	// 1. 判断是否开启纠删码 (Erasure Coding) - 优先级最高
 	if conf.EnableMultiNode {
 		if conf.EnableErasure {
-			shards, err = c.uploadErasure(ctx, file, filesize, nodes, conf)
+			shards, err = c.uploadErasure(ctx, file, filesize, nodes, conf, progress, loaded)
 		} else {
-			shards, err = c.uploadMultiNode(ctx, file, filesize, nodes, conf)
+			shards, err = c.uploadMultiNode(ctx, file, filesize, nodes, conf, progress, loaded)
 		}
 		if err != nil {
 			return nil, err
@@ -258,14 +319,14 @@ func (c *Client) upload(ctx context.Context, sessionId string, file multipart.Fi
 
 		// 2. 判断是否开启分片上传 (Multipart)
 	} else if conf.EnableMultipart {
-		shards, err = c.uploadMultipart(ctx, file, filesize, nodes, conf, resp)
+		shards, err = c.uploadMultipart(ctx, file, filesize, nodes, conf, resp, progress, loaded)
 		if err != nil {
 			return nil, err
 		}
 
 		// 3. 默认简单上传 (Simple Upload)
 	} else {
-		shards, err = c.uploadSimple(ctx, file, filesize, filehash, nodes)
+		shards, err = c.uploadSimple(ctx, file, filesize, filehash, nodes, progress, loaded)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +415,7 @@ func (c *Client) hashCheck(ctx context.Context, sessionId string, merkletree *me
 	return obj, match, err
 }
 
-func (c *Client) uploadMultiNode(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
+func (c *Client) uploadMultiNode(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, progress api.ProgressFunc, loaded *atomic.Int64) ([]api.Shard, error) {
 	chunkSize := conf.MultinodeChunkSize
 	if chunkSize == 0 {
 		chunkSize = defaultBlockSize
@@ -389,7 +450,18 @@ func (c *Client) uploadMultiNode(ctx context.Context, file multipart.File, files
 				// 每次重试都完全重新开始读取这一段
 				r := io.NewSectionReader(file, offset, size)
 				h := md5.New()
-				tr := io.TeeReader(r, h)
+
+				var readStream io.Reader = r
+				if progress != nil {
+					readStream = &progressReader{
+						r:        r,
+						progress: progress,
+						loaded:   loaded,
+						total:    filesize,
+					}
+				}
+
+				tr := io.TeeReader(readStream, h)
 
 				_, err := uploader.UploadFile(egCtx, &v4.PresignedHTTPRequest{
 					URL:          node.Presigned.Url,
@@ -447,7 +519,7 @@ func (c *Client) uploadMultiNode(ctx context.Context, file multipart.File, files
 	return shards, nil
 }
 
-func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig) ([]api.Shard, error) {
+func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, progress api.ProgressFunc, loaded *atomic.Int64) ([]api.Shard, error) {
 	log.Println("检测到开启纠删码上传...")
 	var shardNumber int64 = int64(conf.DataShard + conf.ParityShard)
 	if len(nodes) < int(shardNumber) {
@@ -474,10 +546,18 @@ func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesiz
 		node := n
 
 		eg.Go(func() error {
-			reader := r
+			var reader io.Reader = r
+			if progress != nil {
+				reader = &progressReader{
+					r:        r,
+					progress: progress,
+					loaded:   loaded,
+					total:    filesize * int64(conf.DataShard+conf.ParityShard) / int64(conf.DataShard), // Estimate total erasure volume
+				}
+			}
 			hasher := md5.New()
 			teeReader := io.TeeReader(reader, hasher)
-			defer reader.Close()
+			defer r.Close()
 			endpoint := node.Presigned.Url
 			log.Printf("开始向节点%s上传分片 (索引: %d)", endpoint, index)
 			uploader := manager.NewUploader()
@@ -563,7 +643,7 @@ func (c *Client) uploadErasure(ctx context.Context, file multipart.File, filesiz
 	return shards, nil
 }
 
-func (c *Client) uploadMultipart(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, apiResp *api.UploadNodesResponse) ([]api.Shard, error) {
+func (c *Client) uploadMultipart(ctx context.Context, file multipart.File, filesize int64, nodes []api.PresignedItem, conf api.UploadConfig, apiResp *api.UploadNodesResponse, progress api.ProgressFunc, loaded *atomic.Int64) ([]api.Shard, error) {
 	log.Println("检测到开启 Multipart 分片上传...")
 	uploader := manager.NewUploader()
 	presignParts := make([]*v4.PresignedHTTPRequest, 0, len(nodes))
@@ -578,7 +658,20 @@ func (c *Client) uploadMultipart(ctx context.Context, file multipart.File, files
 			SignedHeader: node.Presigned.Headers,
 		})
 	}
-	resps, err := uploader.UploadPart(ctx, presignParts, file, filesize, conf.MultipartChunkSize)
+
+	// Delegate progress to uploader.UploadPart
+	var onProgress func(int64) = nil
+	if progress != nil {
+		onProgress = func(incr int64) {
+			newLoaded := loaded.Add(incr)
+			if newLoaded > filesize {
+				newLoaded = filesize
+			}
+			progress(newLoaded, filesize)
+		}
+	}
+
+	resps, err := uploader.UploadPart(ctx, presignParts, file, filesize, conf.MultipartChunkSize, onProgress)
 	if err != nil {
 		log.Printf("Multipart 上传分片失败: %v", err)
 		return nil, err
@@ -609,7 +702,7 @@ func (c *Client) uploadMultipart(ctx context.Context, file multipart.File, files
 	return shards, nil
 }
 
-func (c *Client) uploadSimple(ctx context.Context, file multipart.File, filesize int64, filehash string, nodes []api.PresignedItem) ([]api.Shard, error) {
+func (c *Client) uploadSimple(ctx context.Context, file multipart.File, filesize int64, filehash string, nodes []api.PresignedItem, progress api.ProgressFunc, loaded *atomic.Int64) ([]api.Shard, error) {
 	log.Println("执行简单单流上传...")
 	// 简单上传通常只有一个节点
 	if len(nodes) == 0 {
@@ -634,8 +727,18 @@ func (c *Client) uploadSimple(ctx context.Context, file multipart.File, filesize
 	}
 	file.Seek(0, 0) // reset file
 
+	var readStream io.Reader = file
+	if progress != nil {
+		readStream = &progressReader{
+			r:        file,
+			progress: progress,
+			loaded:   loaded,
+			total:    filesize,
+		}
+	}
+
 	// 使用 uploader
-	_, err := uploader.UploadFile(ctx, req, file, filesize)
+	_, err := uploader.UploadFile(ctx, req, readStream, filesize)
 	if err != nil {
 		log.Printf("简单上传失败: %v", err)
 		shard.Message = err.Error()
