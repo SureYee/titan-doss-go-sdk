@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
-	"sync"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -142,7 +142,6 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 	shards := make([][]byte, e.dataBlocks+e.parityBlocks)
 	readErrs := make([]error, len(readers))
 	ns := make([]int, len(readers))
-	var wg sync.WaitGroup
 	number := 1
 	for {
 		// Reset state for next block
@@ -151,35 +150,73 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 			readErrs[i] = nil
 			ns[i] = 0
 		}
-		// Parallel read from all readers
-		wg.Add(len(readers))
+		type readResult struct {
+			i   int
+			n   int
+			err error
+			buf []byte
+		}
+		resCh := make(chan readResult, len(readers))
+		activeReaders := 0
+
+		// Parallel read from all active readers
 		for i, r := range readers {
+			if r == nil {
+				readErrs[i] = io.EOF // Treat nil reader as EOF/Failed
+				continue
+			}
+			activeReaders++
 			go func(i int, r io.Reader) {
-				defer wg.Done()
-				if r == nil {
-					readErrs[i] = io.EOF // Treat nil reader as EOF/Failed
-					return
-				}
 				buf := make([]byte, e.blockSize)
-				var n int
-				var err error
 				// Use ReadFull to try to get full shard.
 				// If last block is partial, ReadFull returns ErrUnexpectedEOF or EOF with n > 0.
-				n, err = io.ReadFull(r, buf)
+				n, err := io.ReadFull(r, buf)
 				log.Printf("从节点%d中读取字节数%d", i, n)
 
-				ns[i] = n
-				readErrs[i] = err
-				if n > 0 {
-					shards[i] = buf
-				}
-				if err != nil {
+				if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 					log.Printf("从节点%d中读取错误:%s", i, err.Error())
-					return
 				}
+				resCh <- readResult{i: i, n: n, err: err, buf: buf}
 			}(i, r)
 		}
-		wg.Wait()
+
+		completedReaders := make([]bool, len(readers))
+		successCount := 0
+		completed := 0
+		var timeoutCh <-chan time.Time
+		delaySeconds := time.Duration(2) * time.Second
+
+		for completed < activeReaders {
+			select {
+			case res := <-resCh:
+				completed++
+				completedReaders[res.i] = true
+				ns[res.i] = res.n
+				readErrs[res.i] = res.err
+				if res.n > 0 {
+					shards[res.i] = res.buf
+					successCount++
+					if successCount == e.dataBlocks && timeoutCh == nil {
+						// 已达到所需的最小数据块连通数，如果存在较慢的节点，最多等待N秒
+						timeoutCh = time.After(delaySeconds)
+					}
+				}
+			case <-timeoutCh:
+				goto ReadDone
+			}
+		}
+
+	ReadDone:
+		// 丢弃未能在超时时间内完成的慢速或阻塞节点，后续不再使用
+		for i := range readers {
+			if readers[i] != nil && !completedReaders[i] {
+				log.Printf("节点%d读取过慢或超时，丢弃并后续不再使用", i)
+				readers[i] = nil
+				ns[i] = 0
+				shards[i] = nil
+				readErrs[i] = errors.New("read timeout")
+			}
+		}
 
 		log.Printf("批次%d读取完成，读取结果: %v", number, ns)
 		number++
