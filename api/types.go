@@ -53,6 +53,10 @@ type CommitObjectReq struct {
 	ShardList []Shard `json:"shardList"`
 }
 
+type CommitObjectResponse struct {
+	FileID int `json:"fileID"`
+}
+
 type LeafHash struct {
 	Hash  string `json:"hash"`
 	Index int64  `json:"index"`

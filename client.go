@@ -17,9 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/cbergoon/merkletree"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/sureyee/titan-doss-go-sdk/api"
@@ -280,7 +278,7 @@ func (c hashContent) Equals(other merkletree.Content) (bool, error) {
 	return bytes.Equal(c.content, otherC.content), nil
 }
 
-func (c *Client) upload(ctx context.Context, sessionId string, file multipart.File, filehash string, filesize int64, opts ...api.OptionFunc) (any, error) {
+func (c *Client) upload(ctx context.Context, sessionId string, file multipart.File, filehash string, filesize int64, opts ...api.OptionFunc) (*api.CommitObjectResponse, error) {
 	// 获取节点列表
 
 	// filehash 已经在外部计算并传入
@@ -335,7 +333,7 @@ func (c *Client) upload(ctx context.Context, sessionId string, file multipart.Fi
 	// 4. 统一提交 (Commit Object)
 	log.Println("开始提交对象信息 (CommitObject)...")
 
-	err = c.api.CommitObject(ctx, api.CommitObjectReq{
+	commitResp, err := c.api.CommitObject(ctx, api.CommitObjectReq{
 		SessionID: sessionId,
 		ShardList: shards,
 	}, opts...)
@@ -346,9 +344,7 @@ func (c *Client) upload(ctx context.Context, sessionId string, file multipart.Fi
 	}
 
 	log.Println("文件上传并提交成功")
-	return &s3.PutObjectOutput{
-		ETag: aws.String(""),
-	}, nil
+	return commitResp, nil
 }
 
 func (c *Client) buildMerkleTreeWithHash(file multipart.File, size int64) (*merkletree.MerkleTree, string, error) {

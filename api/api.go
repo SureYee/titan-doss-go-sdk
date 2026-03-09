@@ -113,21 +113,22 @@ func (s *ApiClient) GetUploadNodes(ctx context.Context, sessionId string, opts .
 	return &d, nil
 }
 
-func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq, opts ...OptionFunc) error {
+func (s *ApiClient) CommitObject(ctx context.Context, req CommitObjectReq, opts ...OptionFunc) (*CommitObjectResponse, error) {
 	r, err := s.buildRequest(ctx, http.MethodPost, V1_CommitObject, nil, req, opts...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	resp, err := s.cli.Do(r)
 	if err != nil {
-		return fmt.Errorf("scheduler request error:%s", err)
+		return nil, fmt.Errorf("scheduler request error:%s", err)
 	}
 	defer resp.Body.Close()
-	if _, err := parseBody[any](resp.Body); err != nil {
-		return err
+	d, err := parseBody[CommitObjectResponse](resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil
+	return &d, nil
 
 }
 
