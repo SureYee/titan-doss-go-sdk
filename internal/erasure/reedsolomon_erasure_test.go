@@ -13,7 +13,7 @@ func TestErasure_EncodeDecode(t *testing.T) {
 	dataBlocks := 10
 	parityBlocks := 4
 	// blockSize must be a multiple of dataBlocks to avoid padding in intermediate blocks during streaming encode
-	blockSize := int64(1020)
+	blockSize := int64(1024)
 
 	e, err := NewErasure(ctx, dataBlocks, parityBlocks, blockSize)
 	if err != nil {

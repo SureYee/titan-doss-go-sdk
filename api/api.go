@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -194,10 +196,12 @@ func (s *ApiClient) genToken() string {
 	if s.accessKey == "" || s.secretKey == "" {
 		return ""
 	}
+	hash := sha256.Sum256([]byte(s.secretKey))
 	token, _ := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
 		"accessKey": s.accessKey,
 		"exp":       time.Now().Add(15 * time.Minute).Unix(),
-	}).SignedString([]byte(s.secretKey))
+		"sub":       "client",
+	}).SignedString(hex.EncodeToString(hash[:]))
 	return token
 }
 
