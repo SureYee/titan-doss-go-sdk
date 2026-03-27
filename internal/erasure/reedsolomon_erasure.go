@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	"github.com/sureyee/titan-doss-go-sdk/log"
 )
 
 // Writes to multiple writers
@@ -171,10 +171,10 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 				// Use ReadFull to try to get full shard.
 				// If last block is partial, ReadFull returns ErrUnexpectedEOF or EOF with n > 0.
 				n, err := io.ReadFull(r, buf)
-				log.Printf("从节点%d中读取字节数%d", i, n)
+				log.Debugf("Read %d bytes from node %d", n, i)
 
 				if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-					log.Printf("从节点%d中读取错误:%s", i, err.Error())
+					log.Debugf("Read error from node %d: %s", i, err.Error())
 				}
 				resCh <- readResult{i: i, n: n, err: err, buf: buf}
 			}(i, r)
@@ -210,7 +210,7 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 		// 丢弃未能在超时时间内完成的慢速或阻塞节点，后续不再使用
 		for i := range readers {
 			if readers[i] != nil && !completedReaders[i] {
-				log.Printf("节点%d读取过慢或超时，丢弃并后续不再使用", i)
+				log.Debugf("Node %d reading too slow or timeout, discarding and not using anymore", i)
 				readers[i] = nil
 				ns[i] = 0
 				shards[i] = nil
@@ -218,7 +218,7 @@ func (e *Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Rea
 			}
 		}
 
-		log.Printf("批次%d读取完成，读取结果: %v", number, ns)
+		log.Debugf("Batch %d read completed, result: %v", number, ns)
 		number++
 
 		// Determine the consensus read length

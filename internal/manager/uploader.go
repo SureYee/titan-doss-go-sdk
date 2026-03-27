@@ -6,12 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"sync"
 
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/sureyee/titan-doss-go-sdk/log"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -40,17 +40,17 @@ func NewUploader() *Uploader {
 }
 
 func upload(u *Uploader, req *http.Request) (*Response, error) {
-	log.Printf("endpoint:%s", req.URL.String())
+	log.Debugf("endpoint:%s", req.URL.String())
 	// 使用 Uploader 内嵌的 http.Client 发送请求
 	// u.Client 是一个标准的 Go HTTP 客户端
-	log.Println("开始调用文件上传")
+	log.Debug("Start calling file upload")
 	// b, _ := httputil.DumpRequest(req, false)
 	// log.Printf("request:%s", b)
 	resp, err := u.Do(req)
-	log.Println("文件上传结束")
+	log.Debug("File upload finished")
 
 	if err != nil {
-		log.Println("出错了：", err.Error())
+		log.Debugf("Error occurred: %v", err)
 
 		return nil, err
 	}
